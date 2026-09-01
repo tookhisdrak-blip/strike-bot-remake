@@ -4,7 +4,7 @@ const path = require('node:path');
 const {
   Client, GatewayIntentBits, Partials, EmbedBuilder, ActionRowBuilder,
   ButtonBuilder, ButtonStyle, StringSelectMenuBuilder, PermissionFlagsBits,
-  AuditLogEvent, ChannelType
+  AuditLogEvent, ChannelType, Role
 } = require('discord.js');
 
 const PREFIX = process.env.PREFIX || '-';
@@ -13,13 +13,19 @@ fs.mkdirSync(dataDir, { recursive: true });
 const file = path.join(dataDir, 'guilds.json');
 let db = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : {};
 const save = () => fs.writeFileSync(file, JSON.stringify(db, null, 2));
-const guildData = guild => db[guild.id] ||= { strikes: {}, removedStrikes: {}, logs: {}, staffRoleId: null, protectedUsers: {}, protectedRoles: {}, aliases: {} };
+const guildData = guild => {
+  const data = db[guild.id] ||= { strikes: {}, removedStrikes: {}, logs: {}, staffRoleId: null, protectedUsers: {}, protectedRoles: {}, staffBlacklistUsers: {}, staffBlacklistRoles: {}, aliases: {} };
+  data.staffBlacklistUsers ||= {};
+  data.staffBlacklistRoles ||= {};
+  return data;
+};
 const embed = (title, description) => new EmbedBuilder().setTitle(title).setDescription(description).setFooter({ text: 'bot created by @6xwg / kutt' }).setTimestamp();
 const reply = (message, title, description, extra = {}) => message.reply({ embeds: [embed(title, description)], ...extra });
 const mentionChannel = (guild, id) => id ? guild.channels.cache.get(id)?.toString() || `<#${id}>` : 'not configured';
 const isOwner = message => message.guild.ownerId === message.author.id;
 const isStaff = message => isOwner(message) || Boolean(guildData(message.guild).staffRoleId && message.member.roles.cache.has(guildData(message.guild).staffRoleId));
 const isAdminRole = role => role && !role.managed && role.permissions.any(PermissionFlagsBits.Administrator | PermissionFlagsBits.ManageGuild | PermissionFlagsBits.ManageRoles | PermissionFlagsBits.BanMembers | PermissionFlagsBits.KickMembers);
+const isStaffBlacklistRole = role => role && !role.managed && role.permissions.any(PermissionFlagsBits.Administrator | PermissionFlagsBits.BanMembers | PermissionFlagsBits.KickMembers | PermissionFlagsBits.ModerateMembers | PermissionFlagsBits.MoveMembers);
 const roleResolver = (guild, input) => guild.roles.cache.get(input?.replace(/[<@&>]/g, '')) || guild.roles.cache.find(role => role.name.toLowerCase() === input?.toLowerCase());
 const userResolver = async (message, token) => message.mentions.users.first() || await message.client.users.fetch(token?.replace(/[<@!>]/g, '')).catch(() => null);
 const parseTargetReason = async message => {
@@ -28,6 +34,12 @@ const parseTargetReason = async message => {
   const target = await userResolver(message, token);
   const reason = parts.slice(2).join(' ').trim();
   return { target, reason };
+};
+const parseBlacklistTargetReason = async message => {
+  const parts = message.content.trim().split(/\s+/);
+  const token = parts[1];
+  const target = message.mentions.roles.first() || roleResolver(message.guild, token) || message.mentions.users.first() || await userResolver(message, token);
+  return { target, reason: parts.slice(2).join(' ').trim() };
 };
 const log = async (guild, kind, title, text) => {
   const data = guildData(guild);
@@ -52,12 +64,12 @@ const commandList = [
   ['-strike @user <reason>', 'Add a strike; third strike removes permission roles'], ['-st @user <reason>', 'Alias for strike'], ['-rmstrike @user <reason>', 'Remove the latest strike'],
   ['-rmst @user <reason>', 'Alias for rmstrike'], ['-clearstrikes @user <reason>', 'Clear every current strike'], ['-strikelist', 'List current strikes, six people per page'],
   ['-protect @user|role|ID', 'Protect a user or role from role removal'], ['-rmprotection @user|role|ID', 'Remove protection'], ['-view @user|role|ID', 'Show protection, strikes, roles, and tenure'],
-  ['-setstaff @user|role|ID', 'Set the required staff role (owner only)'], ['-viewaliases', 'Show every command alias'], ['-botclear', 'Clear the last 20 user/bot response messages']
+  ['-setstaff @role|ID', 'Set the required staff role (owner only)'], ['-resetstaffrole', 'Clear the staff role so it can be reconfigured (owner only)'], ['-staffblacklist @user|role|ID <reason>', 'Blacklist staff permissions with a required reason'], ['-rmstaffblacklist @user|role|ID <reason>', 'Remove a staff blacklist with a required reason'], ['-viewaliases', 'Show every command alias'], ['-botclear', 'Clear the last 20 user/bot response messages']
 ];
 const menus = {
-  moderation: [['strike', '-strike @user <reason>'], ['rmstrike', '-rmstrike @user <reason>'], ['strikelist', '-strikelist'], ['clearstrikes', '-clearstrikes @user <reason>'], ['view', '-view @user|role|ID']],
+  moderation: [['strike', '-strike @user <reason>'], ['rmstrike', '-rmstrike @user <reason>'], ['strikelist', '-strikelist'], ['clearstrikes', '-clearstrikes @user <reason>'], ['staffblacklist', '-staffblacklist @user|role|ID <reason>'], ['rmstaffblacklist', '-rmstaffblacklist @user|role|ID <reason>'], ['view', '-view @user|role|ID']],
   protection: [['protect', '-protect @user|role|ID'], ['rmprotection', '-rmprotection @user|role|ID']],
-  owner: [['setstaff', '-setstaff @role|ID'], ['setlogs protected', '-setlogs protected #channel|ID'], ['setlogs strike', '-setlogs strike #channel|ID'], ['setlogs main', '-setlogs main #channel|ID']]
+  owner: [['setstaff', '-setstaff @role|ID'], ['resetstaffrole', '-resetstaffrole'], ['setlogs protected', '-setlogs protected #channel|ID'], ['setlogs strike', '-setlogs strike #channel|ID'], ['setlogs main', '-setlogs main #channel|ID']]
 };
 const dashboard = (index = 0) => {
   const total = Math.ceil(commandList.length / 6);
@@ -91,8 +103,8 @@ client.on('messageCreate', async message => {
   if (command === 'commands' || command === 'cmds') return message.reply(dashboard());
   if (command === 'logs') return reply(message, 'Configured logs', `Strike: ${mentionChannel(message.guild, data.logs.strike)}\nProtected: ${mentionChannel(message.guild, data.logs.protected)}\nMain: ${mentionChannel(message.guild, data.logs.main)}`);
   if (command === 'viewaliases') return reply(message, 'Aliases', '`-cmds` = `-commands`\n`-st` = `-strike`\n`-rmst` = `-rmstrike`');
-  if (['setlogs', 'setstaff'].includes(command) && !isOwner(message)) return reply(message, 'Owner only', 'Only the guild owner can change bot configuration.');
-  if (!['commands', 'cmds', 'logs', 'viewaliases', 'setlogs', 'setstaff'].includes(command) && !isStaff(message)) return reply(message, 'Access denied', 'You need the configured staff role to use this bot.');
+  if (['setlogs', 'setstaff', 'resetstaffrole'].includes(command) && !isOwner(message)) return reply(message, 'Owner only', 'Only the guild owner can change bot configuration.');
+  if (!['commands', 'cmds', 'logs', 'viewaliases', 'setlogs', 'setstaff', 'resetstaffrole'].includes(command) && !isStaff(message)) return reply(message, 'Access denied', 'You need the configured staff role to use this bot.');
   if (command === 'botclear') {
     if (!message.channel.permissionsFor(message.guild.members.me).has(PermissionFlagsBits.ManageMessages)) return reply(message, 'Cleanup unavailable', 'The bot needs Manage Messages in this channel.');
     const messages = await message.channel.messages.fetch({ limit: 100 });
@@ -104,12 +116,34 @@ client.on('messageCreate', async message => {
   if (command === 'setstaff') {
     const role = roleResolver(message.guild, args[0]);
     if (!role) return reply(message, 'Invalid role', 'Usage: `-setstaff @role|role ID`');
+    if (data.staffRoleId) return reply(message, 'Staff role already configured', `setstaff role already configured to "${message.guild.roles.cache.get(data.staffRoleId)?.name || data.staffRoleId}". To change this do the command \'-resetstaffrole\' to reconfigure the staff role to a new role.`);
     data.staffRoleId = role.id; save(); return reply(message, 'Staff role set', `${role} can now access bot commands.`);
+  }
+  if (command === 'resetstaffrole') {
+    if (!data.staffRoleId) return reply(message, 'No staff role configured', 'Use `-setstaff @role|role ID` to configure one.');
+    const oldRole = message.guild.roles.cache.get(data.staffRoleId);
+    data.staffRoleId = null; save(); return reply(message, 'Staff role reset', `The configured staff role${oldRole ? ` "${oldRole.name}"` : ''} was cleared. Run \'-setstaff @role|role ID\' to set a new one.`);
   }
   if (command === 'setlogs') {
     const type = args.shift()?.toLowerCase(); const channel = message.mentions.channels.first() || message.guild.channels.cache.get(args[0]);
     if (!['strike', 'protected', 'main'].includes(type) || !channel?.isTextBased()) return reply(message, 'Invalid log setup', 'Usage: `-setlogs strike|protected|main #channel|channel ID`');
     data.logs[type] = channel.id; save(); return reply(message, 'Log channel set', `${type} logs will be sent to ${channel}.`);
+  }
+  if (command === 'staffblacklist' || command === 'rmstaffblacklist') {
+    const { target, reason } = await parseBlacklistTargetReason(message);
+    if (!target || !reason) return reply(message, 'Reason required', `A reason is required. Usage: \'-${command} @user|role|ID <reason>\'`);
+    const isRole = target instanceof Role;
+    const collection = isRole ? data.staffBlacklistRoles : data.staffBlacklistUsers;
+    if (command === 'rmstaffblacklist') {
+      if (!collection[target.id]) return reply(message, 'Not blacklisted', `${target} does not have a staff blacklist entry.`);
+      delete collection[target.id]; save(); await log(message.guild, 'protected', 'Staff blacklist removed', `${target} was removed from the staff blacklist by ${message.author}. Reason: ${reason}`); return reply(message, 'Staff blacklist removed', `${target} is no longer staff blacklisted.`);
+    }
+    collection[target.id] = { by: message.author.id, reason, at: new Date().toISOString() };
+    save(); await log(message.guild, 'protected', 'Staff blacklist added', `${target} was staff blacklisted by ${message.author}. Reason: ${reason}`);
+    const member = !isRole ? await message.guild.members.fetch(target.id).catch(() => null) : null;
+    const permissionRoles = member?.roles.cache.filter(isStaffBlacklistRole).map(role => role.id) || [];
+    if (member && permissionRoles.length) await member.roles.remove(permissionRoles, 'Staff blacklist added').catch(() => {});
+    return reply(message, 'Staff blacklist added', `${target} is now staff blacklisted. Any role with ban, kick, timeout, move, or administrator permissions will be automatically removed.`);
   }
   if (command === 'strike' || command === 'st' || command === 'rmstrike' || command === 'rmst' || command === 'clearstrikes') {
     const { target, reason } = await parseTargetReason(message);
@@ -167,6 +201,16 @@ client.on('interactionCreate', async interaction => {
 
 client.on('guildMemberUpdate', async (oldMember, newMember) => {
   const data = guildData(newMember.guild); const protectedEntry = data.protectedUsers[newMember.id];
+  const blacklistedRole = newMember.roles.cache.find(role => data.staffBlacklistRoles[role.id]);
+  const blacklistEntry = data.staffBlacklistUsers[newMember.id] || (blacklistedRole && data.staffBlacklistRoles[blacklistedRole.id]);
+  if (blacklistEntry) {
+    const blacklistRoleIds = new Set(Object.keys(data.staffBlacklistRoles));
+    const permissionRoles = newMember.roles.cache.filter(role => isStaffBlacklistRole(role) && !blacklistRoleIds.has(role.id)).map(role => role.id);
+    if (permissionRoles.length) {
+      await newMember.roles.remove(permissionRoles, 'Staff blacklist enforcement').catch(() => {});
+      await log(newMember.guild, 'protected', 'Staff blacklist enforced', `Removed permission roles from ${newMember} because they are staff blacklisted.`);
+    }
+  }
   const matchingRole = newMember.roles.cache.find(role => data.protectedRoles[role.id]);
   const entry = protectedEntry || (matchingRole && data.protectedRoles[matchingRole.id]);
   if (!entry) return;

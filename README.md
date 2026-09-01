@@ -11,7 +11,7 @@ A prefix-based Discord staff strike and role-protection bot built with `discord.
 5. Copy `.env.example` to `.env` and set `DISCORD_TOKEN`.
 6. Run `npm start`.
 
-The guild owner must first run `-setstaff @role`, then configure logs with `-setlogs strike`, `-setlogs protected`, and `-setlogs main`.
+The guild owner must first run `-setstaff @role`. Only the guild owner can change that role: run `-resetstaffrole` before configuring a replacement. Then configure logs with `-setlogs strike`, `-setlogs protected`, and `-setlogs main`.
 
 All runtime data is stored in `data/guilds.json`, which is ignored by Git. Every bot response and log is sent as a compact colorless embed. Commands use the `-` prefix by default.
 
@@ -20,6 +20,8 @@ All runtime data is stored in `data/guilds.json`, which is ignored by Git. Every
 Run `-commands` or `-cmds` for the interactive command dashboard. It contains moderation, protection, and owner-only command groups.
 
 The dashboard shows six commands per page. Use the dropdown to switch groups and the Previous/Next buttons to browse without rerunning the command. Staff can use `-botclear` to remove up to 20 recent messages from themselves and this bot in the current channel; the bot needs `Manage Messages`.
+
+Staff can use `-staffblacklist @user|role|ID <reason>` and `-rmstaffblacklist @user|role|ID <reason>`. A blacklisted user, or any member assigned a blacklisted role, cannot retain roles with Administrator, Ban Members, Kick Members, Moderate Members, or Move Members permissions.
 
 ## Important Discord limitation
 
