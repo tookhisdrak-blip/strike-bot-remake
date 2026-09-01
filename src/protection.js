@@ -33,6 +33,18 @@ function collectProtectedRoleIds(data, memberId, currentRoleIds = [], previousRo
   return protectedIds;
 }
 
+function getProtectedRoleTargetsForMember(data, memberId, roleIds = []) {
+  const protectedIds = new Set((roleIds || []).filter(Boolean));
+  const protectedUser = data?.protectedUsers?.[memberId];
+  if (protectedUser?.roles) {
+    for (const roleId of protectedUser.roles) protectedIds.add(roleId);
+  }
+  for (const roleId of [...protectedIds]) {
+    if (data?.protectedRoles?.[roleId]) protectedIds.add(roleId);
+  }
+  return [...protectedIds];
+}
+
 function canRemoveProtectedRole(protectedRoleEntry, actorId) {
   if (!protectedRoleEntry) return true;
   return protectedRoleEntry.by === actorId;
@@ -42,5 +54,6 @@ module.exports = {
   PROTECTION_ROLE_FLAGS,
   isPermissionRole,
   collectProtectedRoleIds,
+  getProtectedRoleTargetsForMember,
   canRemoveProtectedRole,
 };
