@@ -6,14 +6,25 @@ const {
   ButtonBuilder, ButtonStyle, StringSelectMenuBuilder, PermissionFlagsBits,
   AuditLogEvent, ChannelType, Role
 } = require('discord.js');
+const {
+  ensureGuildGodmode,
+  hasGodmode,
+  setGodmodeForUser,
+  removeGodmodeForUser,
+  grantRoleGodmode,
+  applyRoleGodmodeToMember,
+} = require('./godmode');
 const { isPermissionRole, collectProtectedRoleIds, getProtectedRoleTargetsForMember, canRemoveProtectedRole } = require('./protection');
 
 const PREFIX = process.env.PREFIX || '-';
 const dataDir = path.join(__dirname, '..', 'data');
 fs.mkdirSync(dataDir, { recursive: true });
 const file = path.join(dataDir, 'guilds.json');
+const godmodeFile = path.join(dataDir, 'godmode.json');
 let db = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : {};
+let godmodeDb = fs.existsSync(godmodeFile) ? JSON.parse(fs.readFileSync(godmodeFile, 'utf8')) : {};
 const save = () => fs.writeFileSync(file, JSON.stringify(db, null, 2));
+const saveGodmode = () => fs.writeFileSync(godmodeFile, JSON.stringify(godmodeDb, null, 2));
 const guildData = guild => {
   const data = db[guild.id] ||= { strikes: {}, removedStrikes: {}, logs: {}, staffRoleId: null, protectedUsers: {}, protectedRoles: {}, staffBlacklistUsers: {}, staffBlacklistRoles: {}, staffBlacklistHistory: [], botProfile: {}, aliases: {} };
   data.staffBlacklistUsers ||= {};
@@ -120,11 +131,11 @@ const commandList = [
   ['-strike @user <reason>', 'Add a strike; third strike removes permission roles'], ['-st @user <reason>', 'Alias for strike'], ['-rmstrike @user <reason>', 'Remove the latest strike'],
   ['-rmst @user <reason>', 'Alias for rmstrike'], ['-clearstrikes @user <reason>', 'Clear every current strike'], ['-strikelist', 'List current strikes, six people per page'],
   ['-protect @user|role|ID', 'Protect a user or role from role removal'], ['-rmprotection @user|role|ID', 'Remove protection'], ['-plist', 'List all protected users and protected roles'], ['-view @user|role|ID', 'Show protection, strikes, roles, and tenure'],
-  ['-setstaff @role|ID', 'Set the required staff role (owner only)'], ['-resetstaffrole', 'Clear the staff role so it can be reconfigured (owner only)'], ['-staffblacklist @user|role|ID <reason>', 'Blacklist staff permissions with a required reason'], ['-rmstaffblacklist @user|role|ID <reason>', 'Remove a staff blacklist with a required reason'], ['-staffblacklistlist', 'List active and removed blacklist history'], ['-avatar <image URL>', 'Change the bot avatar (owner only)'], ['-banner <image URL>', 'Change the bot banner (owner only)'], ['-bio <text>', 'Save bot bio text (owner only; Discord API limitation)'], ['-viewaliases', 'Show every command alias'], ['-botclear', 'Clear the last 20 user/bot response messages']
+  ['-godmode enable|disable|@user|@role', 'Enable Godmode for yourself or grant it with the staff role'], ['-setstaff @role|ID', 'Set the required staff role (owner only)'], ['-resetstaffrole', 'Clear the staff role so it can be reconfigured (owner only)'], ['-staffblacklist @user|role|ID <reason>', 'Blacklist staff permissions with a required reason'], ['-rmstaffblacklist @user|role|ID <reason>', 'Remove a staff blacklist with a required reason'], ['-staffblacklistlist', 'List active and removed blacklist history'], ['-avatar <image URL>', 'Change the bot avatar (owner only)'], ['-banner <image URL>', 'Change the bot banner (owner only)'], ['-bio <text>', 'Save bot bio text (owner only; Discord API limitation)'], ['-viewaliases', 'Show every command alias'], ['-botclear', 'Clear the last 20 user/bot response messages']
 ];
 const menus = {
   moderation: [['strike', '-strike @user <reason>'], ['rmstrike', '-rmstrike @user <reason>'], ['strikelist', '-strikelist'], ['clearstrikes', '-clearstrikes @user <reason>'], ['staffblacklist', '-staffblacklist @user|role|ID <reason>'], ['rmstaffblacklist', '-rmstaffblacklist @user|role|ID <reason>'], ['staffblacklistlist', '-staffblacklistlist'], ['view', '-view @user|role|ID']],
-  protection: [['protect', '-protect @user|role|ID'], ['rmprotection', '-rmprotection @user|role|ID'], ['plist', '-plist']],
+  protection: [['protect', '-protect @user|role|ID'], ['rmprotection', '-rmprotection @user|role|ID'], ['plist', '-plist'], ['godmode', '-godmode enable|disable|@user|@role']],
   owner: [['setstaff', '-setstaff @role|ID'], ['resetstaffrole', '-resetstaffrole'], ['setlogs protected', '-setlogs protected #channel|ID'], ['setlogs strike', '-setlogs strike #channel|ID'], ['setlogs main', '-setlogs main #channel|ID'], ['avatar', '-avatar <image URL>'], ['banner', '-banner <image URL>'], ['bio', '-bio <text>']]
 };
 const dashboard = (index = 0) => {
@@ -142,9 +153,10 @@ const dashboard = (index = 0) => {
   return { embeds: [embed('Strike bot commands', `${commands}\n\nPage ${index + 1}/${total}`)], components: [new ActionRowBuilder().addComponents(select), navigation] };
 };
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent], partials: [Partials.GuildMember] });
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.GuildVoiceStates], partials: [Partials.GuildMember, Partials.User] });
 const cooldowns = new Map();
 const protectionAttempts = new Map();
+const godmodeProcessing = new Set();
 client.once('ready', () => {
   client.user.setPresence({ status: 'online', activities: [{ name: '.gg/intweakin', type: 0 }] });
   console.log(`Ready as ${client.user.tag}`);
@@ -188,6 +200,37 @@ client.on('messageCreate', async message => {
     const removable = matching.filter(item => Date.now() - item.createdTimestamp < 1209600000);
     if (removable.size) await message.channel.bulkDelete(removable, true).catch(() => {});
     return reply(message, 'Bot responses cleared', `Removed ${removable.size} recent message(s) from you and this bot.`);
+  }
+  if (command === 'godmode') {
+    const action = args[0]?.toLowerCase();
+    if (!action) return reply(message, 'Godmode usage', 'Usage: `-godmode enable`, `-godmode disable`, `-godmode @user`, or `-godmode @role`');
+    if (action === 'enable') {
+      setGodmodeForUser(godmodeDb, message.guild.id, message.author.id, { grantedBy: message.author.id, source: 'self', roleIds: [] });
+      saveGodmode();
+      return reply(message, 'Godmode enabled', 'Godmode enabled. You can no longer be server muted or deafened.');
+    }
+    if (action === 'disable') {
+      const removed = removeGodmodeForUser(godmodeDb, message.guild.id, message.author.id);
+      saveGodmode();
+      return reply(message, 'Godmode disabled', removed ? 'Godmode disabled.' : 'Godmode was not enabled for you.');
+    }
+    const hasGrantPermission = isOwner(message) || isStaff(message);
+    if (!hasGrantPermission) return reply(message, 'Permission denied', 'You do not have permission to grant Godmode.');
+    const target = message.mentions.members.first() || message.mentions.roles.first() || roleResolver(message.guild, args[0]) || await userResolver(message, args[0]);
+    if (!target) return reply(message, 'Invalid target', 'Usage: `-godmode @user` or `-godmode @role`');
+    if (target instanceof Role || target.constructor?.name === 'Role') {
+      const roleId = target.id;
+      grantRoleGodmode(godmodeDb, message.guild.id, roleId, message.author.id);
+      for (const member of message.guild.members.cache.values()) {
+        if (member.user.bot || !member.roles.cache.has(roleId)) continue;
+        applyRoleGodmodeToMember(godmodeDb, message.guild.id, member.id, roleId, message.author.id);
+      }
+      saveGodmode();
+      return reply(message, 'Godmode granted to everyone with @role', `Godmode granted to everyone with ${target}.`);
+    }
+    setGodmodeForUser(godmodeDb, message.guild.id, target.id, { grantedBy: message.author.id, source: 'staff', roleIds: [] });
+    saveGodmode();
+    return reply(message, 'Godmode granted to @user', `Godmode granted to ${target}.`);
   }
   if (command === 'setstaff') {
     const role = roleResolver(message.guild, args[0]);
@@ -332,6 +375,14 @@ client.on('interactionCreate', async interaction => {
 });
 
 client.on('guildMemberUpdate', async (oldMember, newMember) => {
+  const guildState = ensureGuildGodmode(godmodeDb, newMember.guild.id);
+  const roleGodmodeIds = Object.keys(guildState.roles);
+  for (const roleId of roleGodmodeIds) {
+    if (newMember.roles.cache.has(roleId)) {
+      applyRoleGodmodeToMember(godmodeDb, newMember.guild.id, newMember.id, roleId, guildState.roles[roleId].by || newMember.id);
+    }
+  }
+
   const data = guildData(newMember.guild);
 
   const blacklistedRole = newMember.roles.cache.find(role => data.staffBlacklistRoles[role.id]);
@@ -404,6 +455,41 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
       if (permissionRoles.length) await offender.roles.remove(permissionRoles, 'Repeated protected-role tampering').catch(() => {});
       protectionAttempts.delete(key);
       await log(newMember.guild, 'protected', 'Protection escalation', `${offender || auditEntry.executor} had permission roles removed after repeated protected-role tampering.`);
+    }
+  }
+});
+
+client.on('voiceStateUpdate', async (oldState, newState) => {
+  const member = newState.member || oldState.member;
+  if (!member || member.user.bot) return;
+  const guildId = member.guild.id;
+  if (!hasGodmode(godmodeDb, guildId, member.id)) return;
+  const muteKey = `${guildId}:${member.id}:mute`;
+  const deafKey = `${guildId}:${member.id}:deaf`;
+
+  const me = member.guild.members.me;
+  const canMute = me && me.permissions.has(PermissionFlagsBits.MuteMembers);
+  const canDeafen = me && me.permissions.has(PermissionFlagsBits.DeafenMembers);
+
+  if (newState.serverMute && !godmodeProcessing.has(muteKey) && canMute) {
+    godmodeProcessing.add(muteKey);
+    try {
+      if (member.voice) await member.voice.setMute(false, 'Godmode protection');
+    } catch (error) {
+      console.error(`Godmode mute enforcement failed for ${member.id}:`, error.message || error);
+    } finally {
+      setTimeout(() => godmodeProcessing.delete(muteKey), 500);
+    }
+  }
+
+  if (newState.serverDeaf && !godmodeProcessing.has(deafKey) && canDeafen) {
+    godmodeProcessing.add(deafKey);
+    try {
+      if (member.voice) await member.voice.setDeaf(false, 'Godmode protection');
+    } catch (error) {
+      console.error(`Godmode deaf enforcement failed for ${member.id}:`, error.message || error);
+    } finally {
+      setTimeout(() => godmodeProcessing.delete(deafKey), 500);
     }
   }
 });
