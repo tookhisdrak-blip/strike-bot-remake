@@ -15,6 +15,7 @@ const {
   applyRoleGodmodeToMember,
 } = require('./godmode');
 const { isPermissionRole, collectProtectedRoleIds, getProtectedRoleTargetsForMember, canRemoveProtectedRole } = require('./protection');
+const { getVoiceStats, getMemberStats } = require('./stats');
 
 const PREFIX = process.env.PREFIX || '-';
 const dataDir = path.join(__dirname, '..', 'data');
@@ -156,7 +157,7 @@ const dashboard = (index = 0) => {
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.GuildVoiceStates], partials: [Partials.GuildMember, Partials.User] });
 const cooldowns = new Map();
 const protectionAttempts = new Map();
-const godmodeProcessing = new Set();
+const godmodeProcessing = new Map();
 client.once('ready', () => {
   client.user.setPresence({ status: 'online', activities: [{ name: '.gg/intweakin', type: 0 }] });
   console.log(`Ready as ${client.user.tag}`);
@@ -171,6 +172,34 @@ client.on('messageCreate', async message => {
   if (command === 'commands' || command === 'cmds') return message.reply(dashboard());
   if (command === 'logs') return reply(message, 'Configured logs', `Strike: ${mentionChannel(message.guild, data.logs.strike)}\nProtected: ${mentionChannel(message.guild, data.logs.protected)}\nMain: ${mentionChannel(message.guild, data.logs.main)}`);
   if (command === 'viewaliases') return reply(message, 'Aliases', '`-cmds` = `-commands`\n`-st` = `-strike`\n`-rmst` = `-rmstrike`');
+  if (command === 'vmc') {
+    const voiceStats = getVoiceStats(message.guild);
+    return message.reply({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(0x5865F2)
+          .addFields(
+            { name: 'vcs:', value: `${voiceStats.channels}`, inline: true },
+            { name: 'members in vc:', value: `${voiceStats.members}`, inline: true }
+          )
+      ]
+    });
+  }
+  if (command === 'mc') {
+    const memberStats = getMemberStats(message.guild);
+    return message.reply({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(0x5865F2)
+          .addFields(
+            { name: 'members:', value: `${memberStats.total}`, inline: true },
+            { name: 'humans:', value: `${memberStats.humans}`, inline: true },
+            { name: 'bots:', value: `${memberStats.bots}`, inline: true },
+            { name: 'new in 24h:', value: `${memberStats.newIn24h}`, inline: true }
+          )
+      ]
+    });
+  }
   const profileCommands = ['avatar', 'banner', 'bio'];
   if ([...profileCommands, 'setlogs', 'setstaff', 'resetstaffrole'].includes(command) && !isOwner(message)) return reply(message, 'Owner only', 'Only the guild owner can change bot configuration.');
   if (profileCommands.includes(command)) {
@@ -462,35 +491,52 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
 client.on('voiceStateUpdate', async (oldState, newState) => {
   const member = newState.member || oldState.member;
   if (!member || member.user.bot) return;
+
   const guildId = member.guild.id;
   if (!hasGodmode(godmodeDb, guildId, member.id)) return;
+
+  const me = member.guild.members.me;
+  if (!me) return;
+
+  const canMute = me.permissions.has(PermissionFlagsBits.MuteMembers);
+  const canDeafen = me.permissions.has(PermissionFlagsBits.DeafenMembers);
+
+  const currentMute = newState.serverMute;
+  const currentDeaf = newState.serverDeaf;
   const muteKey = `${guildId}:${member.id}:mute`;
   const deafKey = `${guildId}:${member.id}:deaf`;
 
-  const me = member.guild.members.me;
-  const canMute = me && me.permissions.has(PermissionFlagsBits.MuteMembers);
-  const canDeafen = me && me.permissions.has(PermissionFlagsBits.DeafenMembers);
+  const now = Date.now();
+  const muteLockedUntil = godmodeProcessing.get(muteKey) || 0;
+  const deafLockedUntil = godmodeProcessing.get(deafKey) || 0;
 
-  if (newState.serverMute && !godmodeProcessing.has(muteKey) && canMute) {
-    godmodeProcessing.add(muteKey);
+  if (currentMute && canMute && now > muteLockedUntil) {
+    const freshState = member.guild.members.cache.get(member.id)?.voice;
+    if (!freshState || !freshState.serverMute) return;
+    godmodeProcessing.set(muteKey, now + 1000);
     try {
-      if (member.voice) await member.voice.setMute(false, 'Godmode protection');
+      await member.voice?.setMute(false, 'Godmode protection');
     } catch (error) {
-      console.error(`Godmode mute enforcement failed for ${member.id}:`, error.message || error);
-    } finally {
-      setTimeout(() => godmodeProcessing.delete(muteKey), 500);
+      console.error(`Godmode mute enforcement failed for ${member.id}:`, error?.message || error);
     }
   }
 
-  if (newState.serverDeaf && !godmodeProcessing.has(deafKey) && canDeafen) {
-    godmodeProcessing.add(deafKey);
+  if (currentDeaf && canDeafen && now > deafLockedUntil) {
+    const freshState = member.guild.members.cache.get(member.id)?.voice;
+    if (!freshState || !freshState.serverDeaf) return;
+    godmodeProcessing.set(deafKey, now + 1000);
     try {
-      if (member.voice) await member.voice.setDeaf(false, 'Godmode protection');
+      await member.voice?.setDeaf(false, 'Godmode protection');
     } catch (error) {
-      console.error(`Godmode deaf enforcement failed for ${member.id}:`, error.message || error);
-    } finally {
-      setTimeout(() => godmodeProcessing.delete(deafKey), 500);
+      console.error(`Godmode deaf enforcement failed for ${member.id}:`, error?.message || error);
     }
+  }
+
+  if (now > (godmodeProcessing.get(muteKey) || 0) && !currentMute) {
+    godmodeProcessing.delete(muteKey);
+  }
+  if (now > (godmodeProcessing.get(deafKey) || 0) && !currentDeaf) {
+    godmodeProcessing.delete(deafKey);
   }
 });
 
