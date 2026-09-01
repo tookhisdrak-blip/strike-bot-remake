@@ -6,6 +6,7 @@ const {
   ButtonBuilder, ButtonStyle, StringSelectMenuBuilder, PermissionFlagsBits,
   AuditLogEvent, ChannelType, Role
 } = require('discord.js');
+const { isPermissionRole, collectProtectedRoleIds, canRemoveProtectedRole } = require('./protection');
 
 const PREFIX = process.env.PREFIX || '-';
 const dataDir = path.join(__dirname, '..', 'data');
@@ -43,6 +44,46 @@ const parseBlacklistTargetReason = async message => {
   const target = message.mentions.roles.first() || roleResolver(message.guild, token) || message.mentions.users.first() || await userResolver(message, token);
   return { target, reason: parts.slice(2).join(' ').trim() };
 };
+const resolveProtectionTarget = async (message, token) => {
+  const mentionMember = message.mentions.members.first();
+  if (mentionMember) return mentionMember;
+  const mentionRole = message.mentions.roles.first();
+  if (mentionRole) return mentionRole;
+  const role = roleResolver(message.guild, token);
+  if (role) return role;
+  const user = token && await userResolver(message, token);
+  if (user) return user;
+  return null;
+};
+const getMemberProtectedRoleIds = (guild, member, data) => {
+  const protectedIds = new Set();
+  const currentRoleIds = member?.roles?.cache.filter(role => role.id !== guild.id).map(role => role.id) || [];
+  const previousRoleIds = data.protectedUsers[member.id]?.roles || [];
+  const roleSet = collectProtectedRoleIds(data, member.id, currentRoleIds, previousRoleIds);
+  for (const roleId of roleSet) {
+    if (guild.roles.cache.get(roleId)) protectedIds.add(roleId);
+  }
+  for (const role of member?.roles?.cache.values?.() || []) {
+    if (isPermissionRole(role)) protectedIds.add(role.id);
+  }
+  return [...protectedIds];
+};
+const restoreProtectedRoles = async (member, guild, data, reason = 'Protected role enforcement') => {
+  const protectedRoleIds = getMemberProtectedRoleIds(guild, member, data);
+  if (!protectedRoleIds.length) return false;
+  const missing = protectedRoleIds.filter(roleId => roleId !== guild.id && !member.roles.cache.has(roleId));
+  if (!missing.length) return false;
+  await member.roles.add(missing, reason).catch(() => {});
+  return true;
+};
+const registerProtectionAttempt = (guildId, offenderId, targetId) => {
+  const key = `${guildId}:${offenderId}:${targetId}`;
+  const now = Date.now();
+  const attempts = (protectionAttempts.get(key) || []).filter(time => now - time < 30000);
+  attempts.push(now);
+  protectionAttempts.set(key, attempts);
+  return attempts;
+};
 const log = async (guild, kind, title, text) => {
   const data = guildData(guild);
   const channels = [data.logs[kind], data.logs.main].filter(Boolean);
@@ -65,12 +106,12 @@ const commandList = [
   ['-commands / -cmds', 'Open the command dashboard'], ['-logs', 'Show configured log channels'], ['-setlogs <type> <channel>', 'Set strike, protected, or main logs'],
   ['-strike @user <reason>', 'Add a strike; third strike removes permission roles'], ['-st @user <reason>', 'Alias for strike'], ['-rmstrike @user <reason>', 'Remove the latest strike'],
   ['-rmst @user <reason>', 'Alias for rmstrike'], ['-clearstrikes @user <reason>', 'Clear every current strike'], ['-strikelist', 'List current strikes, six people per page'],
-  ['-protect @user|role|ID', 'Protect a user or role from role removal'], ['-rmprotection @user|role|ID', 'Remove protection'], ['-view @user|role|ID', 'Show protection, strikes, roles, and tenure'],
+  ['-protect @user|role|ID', 'Protect a user or role from role removal'], ['-rmprotection @user|role|ID', 'Remove protection'], ['-plist', 'List all protected users and protected roles'], ['-view @user|role|ID', 'Show protection, strikes, roles, and tenure'],
   ['-setstaff @role|ID', 'Set the required staff role (owner only)'], ['-resetstaffrole', 'Clear the staff role so it can be reconfigured (owner only)'], ['-staffblacklist @user|role|ID <reason>', 'Blacklist staff permissions with a required reason'], ['-rmstaffblacklist @user|role|ID <reason>', 'Remove a staff blacklist with a required reason'], ['-staffblacklistlist', 'List active and removed blacklist history'], ['-avatar <image URL>', 'Change the bot avatar (owner only)'], ['-banner <image URL>', 'Change the bot banner (owner only)'], ['-bio <text>', 'Save bot bio text (owner only; Discord API limitation)'], ['-viewaliases', 'Show every command alias'], ['-botclear', 'Clear the last 20 user/bot response messages']
 ];
 const menus = {
   moderation: [['strike', '-strike @user <reason>'], ['rmstrike', '-rmstrike @user <reason>'], ['strikelist', '-strikelist'], ['clearstrikes', '-clearstrikes @user <reason>'], ['staffblacklist', '-staffblacklist @user|role|ID <reason>'], ['rmstaffblacklist', '-rmstaffblacklist @user|role|ID <reason>'], ['staffblacklistlist', '-staffblacklistlist'], ['view', '-view @user|role|ID']],
-  protection: [['protect', '-protect @user|role|ID'], ['rmprotection', '-rmprotection @user|role|ID']],
+  protection: [['protect', '-protect @user|role|ID'], ['rmprotection', '-rmprotection @user|role|ID'], ['plist', '-plist']],
   owner: [['setstaff', '-setstaff @role|ID'], ['resetstaffrole', '-resetstaffrole'], ['setlogs protected', '-setlogs protected #channel|ID'], ['setlogs strike', '-setlogs strike #channel|ID'], ['setlogs main', '-setlogs main #channel|ID'], ['avatar', '-avatar <image URL>'], ['banner', '-banner <image URL>'], ['bio', '-bio <text>']]
 };
 const dashboard = (index = 0) => {
@@ -208,12 +249,31 @@ client.on('messageCreate', async message => {
     const people = Object.entries(data.strikes).filter(([, records]) => records.length).sort((a, b) => b[1].at(-1).at.localeCompare(a[1].at(-1).at));
     return message.reply(page('Current strikes', people, 0, Math.ceil(people.length / 6), ([id, records]) => { const latest = records.at(-1); return `<@${id}>: **${records.length}/3**\nLatest: <t:${Math.floor(new Date(latest.at).getTime() / 1000)}:R> by <@${latest.by}>\n${latest.reason}`; }, `strikes:${message.author.id}`));
   }
-  if (command === 'protect' || command === 'rmprotection' || command === 'view') {
-    const target = message.mentions.members.first() || message.mentions.roles.first() || roleResolver(message.guild, args[0]) || await userResolver(message, args[0]);
+  if (command === 'protect' || command === 'rmprotection' || command === 'view' || command === 'plist') {
+    if (command === 'plist') {
+      const protectedUsers = Object.entries(data.protectedUsers).map(([id, record]) => `• <@${id}> protected by <@${record.by}> (${record.roles?.length || 0} role snapshot entries)`).join('\n');
+      const protectedRoles = Object.entries(data.protectedRoles).map(([id, record]) => `• <@&${id}> protected by <@${record.by}>`).join('\n');
+      const body = [protectedUsers || 'No protected users.', protectedRoles || 'No protected roles.'].join('\n\n');
+      return reply(message, 'Protection list', body.length > 1800 ? `${body.slice(0, 1800)}...` : body);
+    }
+    const target = await resolveProtectionTarget(message, args[0]);
     if (!target) return reply(message, 'Invalid target', `Usage: ${PREFIX}${command} @user|role|ID`);
-    const id = target.id; const isRole = target instanceof Object && target.constructor.name === 'Role';
-    if (command === 'protect') { const snapshot = isRole ? [] : (message.guild.members.cache.get(id)?.roles.cache.filter(role => role.id !== message.guild.id).map(role => role.id) || []); (isRole ? data.protectedRoles : data.protectedUsers)[id] = { by: message.author.id, roles: snapshot, at: new Date().toISOString() }; save(); await log(message.guild, 'protected', 'Protection granted', `${target} protected by ${message.author}.`); return reply(message, 'Protection granted', `${target} is now protected.`); }
-    if (command === 'rmprotection') { delete (isRole ? data.protectedRoles : data.protectedUsers)[id]; save(); await log(message.guild, 'protected', 'Protection removed', `${target} protection removed by ${message.author}.`); return reply(message, 'Protection removed', `${target} is no longer protected.`); }
+    const id = target.id; const isRole = target instanceof Role || target.constructor?.name === 'Role';
+    if (command === 'protect') {
+      const member = !isRole ? await message.guild.members.fetch(id).catch(() => null) : null;
+      const snapshot = isRole ? [] : (member?.roles.cache.filter(role => role.id !== message.guild.id).map(role => role.id) || []);
+      const record = { by: message.author.id, roles: snapshot, at: new Date().toISOString() };
+      if (isRole) data.protectedRoles[id] = record; else data.protectedUsers[id] = record;
+      save();
+      await log(message.guild, 'protected', 'Protection granted', `${target} protected by ${message.author}.`);
+      return reply(message, 'Protection granted', `${target} is now protected.`);
+    }
+    if (command === 'rmprotection') {
+      delete (isRole ? data.protectedRoles : data.protectedUsers)[id];
+      save();
+      await log(message.guild, 'protected', 'Protection removed', `${target} protection removed by ${message.author}.`);
+      return reply(message, 'Protection removed', `${target} is no longer protected.`);
+    }
     const member = !isRole ? await message.guild.members.fetch(id).catch(() => null) : null; const records = data.strikes[id] || []; const removed = data.removedStrikes[id] || [];
     const currentHistory = records.map(record => `<t:${Math.floor(new Date(record.at).getTime() / 1000)}:d> by <@${record.by}>: ${record.reason}`).join('\n') || 'none';
     const removedHistory = removed.map(record => `<t:${Math.floor(new Date(record.removedAt).getTime() / 1000)}:d> by <@${record.removedBy}>: ${record.removalReason}`).join('\n') || 'none';
@@ -254,7 +314,8 @@ client.on('interactionCreate', async interaction => {
 });
 
 client.on('guildMemberUpdate', async (oldMember, newMember) => {
-  const data = guildData(newMember.guild); const protectedEntry = data.protectedUsers[newMember.id];
+  const data = guildData(newMember.guild);
+
   const blacklistedRole = newMember.roles.cache.find(role => data.staffBlacklistRoles[role.id]);
   const blacklistEntry = data.staffBlacklistUsers[newMember.id] || (blacklistedRole && data.staffBlacklistRoles[blacklistedRole.id]);
   if (blacklistEntry) {
@@ -265,29 +326,81 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
       await log(newMember.guild, 'protected', 'Staff blacklist enforced', `Removed permission roles from ${newMember} because they are staff blacklisted.`);
     }
   }
-  const matchingRole = newMember.roles.cache.find(role => data.protectedRoles[role.id]);
-  const entry = protectedEntry || (matchingRole && data.protectedRoles[matchingRole.id]);
-  if (!entry) return;
-  const expected = new Set(entry.roles || oldMember.roles.cache.map(role => role.id));
-  const missing = [...expected].filter(id => id !== newMember.guild.id && !newMember.roles.cache.has(id));
-  const protectedRoleId = matchingRole?.id || (data.protectedUsers[newMember.id]?.roleId);
-  if (protectedRoleId && !newMember.roles.cache.has(protectedRoleId)) missing.push(protectedRoleId);
-  if (!missing.length) return;
-  const audit = await newMember.guild.fetchAuditLogs({ type: AuditLogEvent.MemberRoleUpdate, limit: 5 }).catch(() => null);
-  const auditEntry = audit?.entries.find(item => item.target?.id === newMember.id && Date.now() - item.createdTimestamp < 10000);
-  if (auditEntry?.executor?.id === entry.by) return;
-  if (auditEntry?.executor?.id && auditEntry.executor.id !== client.user.id) {
-    const key = `${newMember.guild.id}:${auditEntry.executor.id}`; const recent = (protectionAttempts.get(key) || []).filter(at => Date.now() - at < 30000); recent.push(Date.now()); protectionAttempts.set(key, recent);
-    if (recent.length >= 4) {
-      const executor = await newMember.guild.members.fetch(auditEntry.executor.id).catch(() => null);
-      const permissionRoles = executor?.roles.cache.filter(isAdminRole).map(role => role.id) || [];
-      if (permissionRoles.length) await executor.roles.remove(permissionRoles, 'Repeated protected-role removal attempts').catch(() => {});
-      protectionAttempts.delete(key);
-      await log(newMember.guild, 'protected', 'Protection escalation', `${executor || auditEntry.executor} had permission roles removed after 4 protected-role attempts in 30 seconds.`);
+
+  const protectedUserEntry = data.protectedUsers[newMember.id];
+  const missingProtected = new Set();
+  if (protectedUserEntry?.roles?.length) {
+    for (const roleId of protectedUserEntry.roles) {
+      if (roleId !== newMember.guild.id && !newMember.roles.cache.has(roleId)) missingProtected.add(roleId);
     }
   }
-  await newMember.roles.add([...new Set(missing)], 'Restore protected roles').catch(() => {});
-  await log(newMember.guild, 'protected', 'Protected roles restored', `Restored roles for ${newMember} after an unauthorized role change.`);
+  for (const role of newMember.roles.cache.values()) {
+    if (data.protectedRoles[role.id]) missingProtected.delete(role.id);
+  }
+  for (const roleId of Object.keys(data.protectedRoles)) {
+    if (newMember.roles.cache.has(roleId)) missingProtected.delete(roleId);
+  }
+
+  const audit = await newMember.guild.fetchAuditLogs({ type: AuditLogEvent.MemberRoleUpdate, limit: 20 }).catch(() => null);
+  const auditEntry = audit?.entries.find(entry => entry.target?.id === newMember.id && Date.now() - entry.createdTimestamp < 10000 && entry.executor?.id !== client.user.id);
+  const executorId = auditEntry?.executor?.id;
+
+  if (protectedUserEntry && missingProtected.size) {
+    if (executorId && executorId !== protectedUserEntry.by) {
+      const key = `${newMember.guild.id}:${executorId}:${newMember.id}`;
+      const recent = (protectionAttempts.get(key) || []).filter(time => Date.now() - time < 30000);
+      recent.push(Date.now());
+      protectionAttempts.set(key, recent);
+      if (recent.length >= 3) {
+        const offender = await newMember.guild.members.fetch(executorId).catch(() => null);
+        const permissionRoles = offender?.roles.cache.filter(role => isPermissionRole(role)).map(role => role.id) || [];
+        if (permissionRoles.length) await offender.roles.remove(permissionRoles, 'Repeated protected-user tampering').catch(() => {});
+        protectionAttempts.delete(key);
+        await log(newMember.guild, 'protected', 'Protection escalation', `${offender || auditEntry.executor} had permission roles removed after repeated tampering with a protected user.`);
+      }
+    }
+    await newMember.roles.add([...missingProtected], 'Restore protected user roles').catch(() => {});
+    await log(newMember.guild, 'protected', 'Protected roles restored', `Restored protected roles for ${newMember} after an unauthorized role change.`);
+    return;
+  }
+
+  const protectedRoleIds = [...newMember.roles.cache.keys()].filter(roleId => data.protectedRoles[roleId]);
+  const protectedRoleMissing = [...oldMember.roles.cache.keys()].filter(roleId => !newMember.roles.cache.has(roleId) && data.protectedRoles[roleId]);
+  for (const roleId of protectedRoleMissing) {
+    const protectorId = data.protectedRoles[roleId]?.by;
+    if (executorId && protectorId && executorId !== protectorId) {
+      await newMember.roles.add(roleId, 'Protected role re-added').catch(() => {});
+      await log(newMember.guild, 'protected', 'Protected role restored', `Re-added protected role <@&${roleId}> to ${newMember} because ${auditEntry.executor} is not the protector.`);
+      return;
+    }
+  }
+
+  for (const roleId of protectedRoleIds) {
+    const protectedRoleInfo = data.protectedRoles[roleId];
+    if (!protectedRoleInfo) continue;
+    const isAllowedRemoval = !executorId || executorId === protectedRoleInfo.by;
+    if (!isAllowedRemoval) {
+      await newMember.roles.add(roleId, 'Protected role enforcement').catch(() => {});
+      await log(newMember.guild, 'protected', 'Protected role restored', `Restored protected role <@&${roleId}> to ${newMember} because it was removed without the original protector.`);
+    }
+  }
+
+  const currentProtectedRole = [...newMember.roles.cache.keys()].filter(roleId => data.protectedRoles[roleId]);
+  for (const roleId of currentProtectedRole) {
+    const protectedRoleInfo = data.protectedRoles[roleId];
+    if (!protectedRoleInfo || !executorId || executorId === protectedRoleInfo.by) continue;
+    const key = `${newMember.guild.id}:${executorId}:${roleId}`;
+    const recent = (protectionAttempts.get(key) || []).filter(time => Date.now() - time < 30000);
+    recent.push(Date.now());
+    protectionAttempts.set(key, recent);
+    if (recent.length >= 3) {
+      const offender = await newMember.guild.members.fetch(executorId).catch(() => null);
+      const permissionRoles = offender?.roles.cache.filter(role => isPermissionRole(role)).map(role => role.id) || [];
+      if (permissionRoles.length) await offender.roles.remove(permissionRoles, 'Repeated protected-role tampering').catch(() => {});
+      protectionAttempts.delete(key);
+      await log(newMember.guild, 'protected', 'Protection escalation', `${offender || auditEntry.executor} had permission roles removed after repeated protected-role tampering.`);
+    }
+  }
 });
 
 if (!process.env.DISCORD_TOKEN) { console.error('Missing DISCORD_TOKEN. Copy .env.example to .env and add your bot token.'); process.exitCode = 1; } else client.login(process.env.DISCORD_TOKEN);
