@@ -51,20 +51,26 @@ const commandList = [
   ['-strike @user <reason>', 'Add a strike; third strike removes permission roles'], ['-st @user <reason>', 'Alias for strike'], ['-rmstrike @user <reason>', 'Remove the latest strike'],
   ['-rmst @user <reason>', 'Alias for rmstrike'], ['-clearstrikes @user <reason>', 'Clear every current strike'], ['-strikelist', 'List current strikes, six people per page'],
   ['-protect @user|role|ID', 'Protect a user or role from role removal'], ['-rmprotection @user|role|ID', 'Remove protection'], ['-view @user|role|ID', 'Show protection, strikes, roles, and tenure'],
-  ['-setstaff @user|role|ID', 'Set the required staff role (owner only)'], ['-viewaliases', 'Show every command alias']
+  ['-setstaff @user|role|ID', 'Set the required staff role (owner only)'], ['-viewaliases', 'Show every command alias'], ['-botclear', 'Clear the last 20 user/bot response messages']
 ];
 const menus = {
   moderation: [['strike', '-strike @user <reason>'], ['rmstrike', '-rmstrike @user <reason>'], ['strikelist', '-strikelist'], ['clearstrikes', '-clearstrikes @user <reason>'], ['view', '-view @user|role|ID']],
   protection: [['protect', '-protect @user|role|ID'], ['rmprotection', '-rmprotection @user|role|ID']],
   owner: [['setstaff', '-setstaff @role|ID'], ['setlogs protected', '-setlogs protected #channel|ID'], ['setlogs strike', '-setlogs strike #channel|ID'], ['setlogs main', '-setlogs main #channel|ID']]
 };
-const dashboard = () => {
+const dashboard = (index = 0) => {
+  const total = Math.ceil(commandList.length / 6);
+  const commands = commandList.slice(index * 6, index * 6 + 6).map(([usage, description]) => `**${usage}**\n${description}`).join('\n\n');
   const select = new StringSelectMenuBuilder().setCustomId('menu:commands').setPlaceholder('Choose a command group').addOptions(
     { label: 'Moderation', value: 'moderation', description: 'Strike and review staff' },
     { label: 'Protection', value: 'protection', description: 'Protect users and roles' },
     { label: 'Server owner', value: 'owner', description: 'Server-only configuration' }
   );
-  return { embeds: [embed('Strike bot commands', 'Choose a group below to view compact usage examples.')], components: [new ActionRowBuilder().addComponents(select)] };
+  const navigation = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`commands:page:${index - 1}`).setLabel('Previous').setStyle(ButtonStyle.Secondary).setDisabled(index === 0),
+    new ButtonBuilder().setCustomId(`commands:page:${index + 1}`).setLabel('Next').setStyle(ButtonStyle.Secondary).setDisabled(index >= total - 1)
+  );
+  return { embeds: [embed('Strike bot commands', `${commands}\n\nPage ${index + 1}/${total}`)], components: [new ActionRowBuilder().addComponents(select), navigation] };
 };
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent], partials: [Partials.GuildMember] });
@@ -83,6 +89,14 @@ client.on('messageCreate', async message => {
   if (command === 'viewaliases') return reply(message, 'Aliases', '`-cmds` = `-commands`\n`-st` = `-strike`\n`-rmst` = `-rmstrike`');
   if (['setlogs', 'setstaff'].includes(command) && !isOwner(message)) return reply(message, 'Owner only', 'Only the guild owner can change bot configuration.');
   if (!['commands', 'cmds', 'logs', 'viewaliases', 'setlogs', 'setstaff'].includes(command) && !isStaff(message)) return reply(message, 'Access denied', 'You need the configured staff role to use this bot.');
+  if (command === 'botclear') {
+    if (!message.channel.permissionsFor(message.guild.members.me).has(PermissionFlagsBits.ManageMessages)) return reply(message, 'Cleanup unavailable', 'The bot needs Manage Messages in this channel.');
+    const messages = await message.channel.messages.fetch({ limit: 100 });
+    const matching = messages.filter(item => item.author.id === message.author.id || item.author.id === client.user.id).first(20);
+    const removable = matching.filter(item => Date.now() - item.createdTimestamp < 1209600000);
+    if (removable.size) await message.channel.bulkDelete(removable, true).catch(() => {});
+    return reply(message, 'Bot responses cleared', `Removed ${removable.size} recent message(s) from you and this bot.`);
+  }
   if (command === 'setstaff') {
     const role = roleResolver(message.guild, args[0]);
     if (!role) return reply(message, 'Invalid role', 'Usage: `-setstaff @role|role ID`');
@@ -133,7 +147,10 @@ client.on('messageCreate', async message => {
 
 client.on('interactionCreate', async interaction => {
   if (interaction.isStringSelectMenu() && interaction.customId === 'menu:commands') {
-    const items = menus[interaction.values[0]]; return interaction.update({ embeds: [embed(`${interaction.values[0]} commands`, items.map(([name, usage]) => `**-${usage.replace(/^-/, '')}**`).join('\n'))], components: [] });
+    const items = menus[interaction.values[0]]; return interaction.update({ embeds: [embed(`${interaction.values[0]} commands`, items.map(([name, usage]) => `**${usage}**`).join('\n'))], components: [interaction.message.components[0], interaction.message.components[1]] });
+  }
+  if (interaction.isButton() && interaction.customId.startsWith('commands:page:')) {
+    const index = Number(interaction.customId.split(':')[2]); return interaction.update(dashboard(index));
   }
   if (interaction.isButton() && interaction.customId.startsWith('strikes:')) {
     const [, ownerId, indexText] = interaction.customId.split(':');

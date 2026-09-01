@@ -19,6 +19,8 @@ All runtime data is stored in `data/guilds.json`, which is ignored by Git. Every
 
 Run `-commands` or `-cmds` for the interactive command dashboard. It contains moderation, protection, and owner-only command groups.
 
+The dashboard shows six commands per page. Use the dropdown to switch groups and the Previous/Next buttons to browse without rerunning the command. Staff can use `-botclear` to remove up to 20 recent messages from themselves and this bot in the current channel; the bot needs `Manage Messages`.
+
 ## Important Discord limitation
 
 Protection restoration depends on the bot’s role hierarchy and audit-log access. Discord does not expose the executor directly in `guildMemberUpdate`, so the bot restores protected roles whenever it detects they are missing. Keep the bot above protected roles and do not give it a role that outranks the server owner.
