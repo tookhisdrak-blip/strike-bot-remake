@@ -14,7 +14,7 @@ const file = path.join(dataDir, 'guilds.json');
 let db = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : {};
 const save = () => fs.writeFileSync(file, JSON.stringify(db, null, 2));
 const guildData = guild => db[guild.id] ||= { strikes: {}, removedStrikes: {}, logs: {}, staffRoleId: null, protectedUsers: {}, protectedRoles: {}, aliases: {} };
-const embed = (title, description) => new EmbedBuilder().setTitle(title).setDescription(description).setTimestamp();
+const embed = (title, description) => new EmbedBuilder().setTitle(title).setDescription(description).setFooter({ text: 'bot created by @6xwg / kutt' }).setTimestamp();
 const reply = (message, title, description, extra = {}) => message.reply({ embeds: [embed(title, description)], ...extra });
 const mentionChannel = (guild, id) => id ? guild.channels.cache.get(id)?.toString() || `<#${id}>` : 'not configured';
 const isOwner = message => message.guild.ownerId === message.author.id;
@@ -77,7 +77,10 @@ const dashboard = (index = 0) => {
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent], partials: [Partials.GuildMember] });
 const cooldowns = new Map();
 const protectionAttempts = new Map();
-client.once('ready', () => console.log(`Ready as ${client.user.tag}`));
+client.once('ready', () => {
+  client.user.setPresence({ status: 'online', activities: [{ name: '.gg/intweakin', type: 0 }] });
+  console.log(`Ready as ${client.user.tag}`);
+});
 
 client.on('messageCreate', async message => {
   if (!message.guild || message.author.bot || !message.content.startsWith(PREFIX)) return;
