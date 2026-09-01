@@ -23,6 +23,8 @@ The dashboard shows six commands per page. Use the dropdown to switch groups and
 
 Staff can use `-staffblacklist @user|role|ID <reason>` and `-rmstaffblacklist @user|role|ID <reason>`. A blacklisted user, or any member assigned a blacklisted role, cannot retain roles with Administrator, Ban Members, Kick Members, Moderate Members, or Move Members permissions.
 
+Use `-staffblacklistlist` to review active blacklist entries and removed blacklist history, with six entries per page and button navigation.
+
 ## Important Discord limitation
 
 Protection restoration depends on the bot’s role hierarchy and audit-log access. Discord does not expose the executor directly in `guildMemberUpdate`, so the bot restores protected roles whenever it detects they are missing. Keep the bot above protected roles and do not give it a role that outranks the server owner.

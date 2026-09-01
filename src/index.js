@@ -14,9 +14,10 @@ const file = path.join(dataDir, 'guilds.json');
 let db = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : {};
 const save = () => fs.writeFileSync(file, JSON.stringify(db, null, 2));
 const guildData = guild => {
-  const data = db[guild.id] ||= { strikes: {}, removedStrikes: {}, logs: {}, staffRoleId: null, protectedUsers: {}, protectedRoles: {}, staffBlacklistUsers: {}, staffBlacklistRoles: {}, aliases: {} };
+  const data = db[guild.id] ||= { strikes: {}, removedStrikes: {}, logs: {}, staffRoleId: null, protectedUsers: {}, protectedRoles: {}, staffBlacklistUsers: {}, staffBlacklistRoles: {}, staffBlacklistHistory: [], aliases: {} };
   data.staffBlacklistUsers ||= {};
   data.staffBlacklistRoles ||= {};
+  data.staffBlacklistHistory ||= [];
   return data;
 };
 const embed = (title, description) => new EmbedBuilder().setTitle(title).setDescription(description).setFooter({ text: 'bot created by @6xwg / kutt' }).setTimestamp();
@@ -64,10 +65,10 @@ const commandList = [
   ['-strike @user <reason>', 'Add a strike; third strike removes permission roles'], ['-st @user <reason>', 'Alias for strike'], ['-rmstrike @user <reason>', 'Remove the latest strike'],
   ['-rmst @user <reason>', 'Alias for rmstrike'], ['-clearstrikes @user <reason>', 'Clear every current strike'], ['-strikelist', 'List current strikes, six people per page'],
   ['-protect @user|role|ID', 'Protect a user or role from role removal'], ['-rmprotection @user|role|ID', 'Remove protection'], ['-view @user|role|ID', 'Show protection, strikes, roles, and tenure'],
-  ['-setstaff @role|ID', 'Set the required staff role (owner only)'], ['-resetstaffrole', 'Clear the staff role so it can be reconfigured (owner only)'], ['-staffblacklist @user|role|ID <reason>', 'Blacklist staff permissions with a required reason'], ['-rmstaffblacklist @user|role|ID <reason>', 'Remove a staff blacklist with a required reason'], ['-viewaliases', 'Show every command alias'], ['-botclear', 'Clear the last 20 user/bot response messages']
+  ['-setstaff @role|ID', 'Set the required staff role (owner only)'], ['-resetstaffrole', 'Clear the staff role so it can be reconfigured (owner only)'], ['-staffblacklist @user|role|ID <reason>', 'Blacklist staff permissions with a required reason'], ['-rmstaffblacklist @user|role|ID <reason>', 'Remove a staff blacklist with a required reason'], ['-staffblacklistlist', 'List active and removed blacklist history'], ['-viewaliases', 'Show every command alias'], ['-botclear', 'Clear the last 20 user/bot response messages']
 ];
 const menus = {
-  moderation: [['strike', '-strike @user <reason>'], ['rmstrike', '-rmstrike @user <reason>'], ['strikelist', '-strikelist'], ['clearstrikes', '-clearstrikes @user <reason>'], ['staffblacklist', '-staffblacklist @user|role|ID <reason>'], ['rmstaffblacklist', '-rmstaffblacklist @user|role|ID <reason>'], ['view', '-view @user|role|ID']],
+  moderation: [['strike', '-strike @user <reason>'], ['rmstrike', '-rmstrike @user <reason>'], ['strikelist', '-strikelist'], ['clearstrikes', '-clearstrikes @user <reason>'], ['staffblacklist', '-staffblacklist @user|role|ID <reason>'], ['rmstaffblacklist', '-rmstaffblacklist @user|role|ID <reason>'], ['staffblacklistlist', '-staffblacklistlist'], ['view', '-view @user|role|ID']],
   protection: [['protect', '-protect @user|role|ID'], ['rmprotection', '-rmprotection @user|role|ID']],
   owner: [['setstaff', '-setstaff @role|ID'], ['resetstaffrole', '-resetstaffrole'], ['setlogs protected', '-setlogs protected #channel|ID'], ['setlogs strike', '-setlogs strike #channel|ID'], ['setlogs main', '-setlogs main #channel|ID']]
 };
@@ -136,14 +137,30 @@ client.on('messageCreate', async message => {
     const collection = isRole ? data.staffBlacklistRoles : data.staffBlacklistUsers;
     if (command === 'rmstaffblacklist') {
       if (!collection[target.id]) return reply(message, 'Not blacklisted', `${target} does not have a staff blacklist entry.`);
+      const previous = collection[target.id];
+      data.staffBlacklistHistory.push({ targetId: target.id, targetType: isRole ? 'role' : 'user', ...previous, action: 'removed', removedBy: message.author.id, removedAt: new Date().toISOString(), removalReason: reason });
       delete collection[target.id]; save(); await log(message.guild, 'protected', 'Staff blacklist removed', `${target} was removed from the staff blacklist by ${message.author}. Reason: ${reason}`); return reply(message, 'Staff blacklist removed', `${target} is no longer staff blacklisted.`);
     }
-    collection[target.id] = { by: message.author.id, reason, at: new Date().toISOString() };
+    const record = { targetId: target.id, targetType: isRole ? 'role' : 'user', action: 'added', by: message.author.id, reason, at: new Date().toISOString() };
+    collection[target.id] = record;
+    data.staffBlacklistHistory.push(record);
     save(); await log(message.guild, 'protected', 'Staff blacklist added', `${target} was staff blacklisted by ${message.author}. Reason: ${reason}`);
     const member = !isRole ? await message.guild.members.fetch(target.id).catch(() => null) : null;
     const permissionRoles = member?.roles.cache.filter(isStaffBlacklistRole).map(role => role.id) || [];
     if (member && permissionRoles.length) await member.roles.remove(permissionRoles, 'Staff blacklist added').catch(() => {});
     return reply(message, 'Staff blacklist added', `${target} is now staff blacklisted. Any role with ban, kick, timeout, move, or administrator permissions will be automatically removed.`);
+  }
+  if (command === 'staffblacklistlist') {
+    const active = [...Object.entries(data.staffBlacklistUsers).map(([id, record]) => ({ id, ...record, targetType: 'user', action: 'active' })), ...Object.entries(data.staffBlacklistRoles).map(([id, record]) => ({ id, ...record, targetType: 'role', action: 'active' }))];
+    const history = data.staffBlacklistHistory.filter(record => record.action === 'removed').map(record => ({ id: record.targetId, ...record }));
+    const entries = [...active, ...history].sort((left, right) => new Date(right.removedAt || right.at).getTime() - new Date(left.removedAt || left.at).getTime());
+    return message.reply(page('Staff blacklist history', entries, 0, Math.ceil(entries.length / 6), record => {
+      const target = record.targetType === 'role' ? `<@&${record.id}>` : `<@${record.id}>`;
+      const date = record.removedAt || record.at;
+      const action = record.action === 'active' ? 'ACTIVE' : 'REMOVED';
+      const detail = record.action === 'removed' ? `Removed by <@${record.removedBy}>: ${record.removalReason}` : `By <@${record.by}>: ${record.reason}`;
+      return `**${action}** ${target} (${record.targetType})\n<t:${Math.floor(new Date(date).getTime() / 1000)}:R>\n${detail.slice(0, 700)}`;
+    }, `blacklist:${message.author.id}`));
   }
   if (command === 'strike' || command === 'st' || command === 'rmstrike' || command === 'rmst' || command === 'clearstrikes') {
     const { target, reason } = await parseTargetReason(message);
@@ -189,6 +206,22 @@ client.on('interactionCreate', async interaction => {
   }
   if (interaction.isButton() && interaction.customId.startsWith('commands:page:')) {
     const index = Number(interaction.customId.split(':')[2]); return interaction.update(dashboard(index));
+  }
+  if (interaction.isButton() && interaction.customId.startsWith('blacklist:')) {
+    const [, ownerId, indexText] = interaction.customId.split(':');
+    if (ownerId !== interaction.user.id) return interaction.reply({ embeds: [embed('Navigation locked', 'Only the person who opened this list can change its page.')], ephemeral: true });
+    const data = guildData(interaction.guild);
+    const active = [...Object.entries(data.staffBlacklistUsers).map(([id, record]) => ({ id, ...record, targetType: 'user', action: 'active' })), ...Object.entries(data.staffBlacklistRoles).map(([id, record]) => ({ id, ...record, targetType: 'role', action: 'active' }))];
+    const history = data.staffBlacklistHistory.filter(record => record.action === 'removed').map(record => ({ id: record.targetId, ...record }));
+    const entries = [...active, ...history].sort((left, right) => new Date(right.removedAt || right.at).getTime() - new Date(left.removedAt || left.at).getTime());
+    const index = Number(indexText); const total = Math.ceil(entries.length / 6);
+    return interaction.update(page('Staff blacklist history', entries, index, total, record => {
+      const target = record.targetType === 'role' ? `<@&${record.id}>` : `<@${record.id}>`;
+      const date = record.removedAt || record.at;
+      const action = record.action === 'active' ? 'ACTIVE' : 'REMOVED';
+      const detail = record.action === 'removed' ? `Removed by <@${record.removedBy}>: ${record.removalReason}` : `By <@${record.by}>: ${record.reason}`;
+      return `**${action}** ${target} (${record.targetType})\n<t:${Math.floor(new Date(date).getTime() / 1000)}:R>\n${detail.slice(0, 700)}`;
+    }, `blacklist:${ownerId}`));
   }
   if (interaction.isButton() && interaction.customId.startsWith('strikes:')) {
     const [, ownerId, indexText] = interaction.customId.split(':');
