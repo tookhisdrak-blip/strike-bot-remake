@@ -14,10 +14,11 @@ const file = path.join(dataDir, 'guilds.json');
 let db = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : {};
 const save = () => fs.writeFileSync(file, JSON.stringify(db, null, 2));
 const guildData = guild => {
-  const data = db[guild.id] ||= { strikes: {}, removedStrikes: {}, logs: {}, staffRoleId: null, protectedUsers: {}, protectedRoles: {}, staffBlacklistUsers: {}, staffBlacklistRoles: {}, staffBlacklistHistory: [], aliases: {} };
+  const data = db[guild.id] ||= { strikes: {}, removedStrikes: {}, logs: {}, staffRoleId: null, protectedUsers: {}, protectedRoles: {}, staffBlacklistUsers: {}, staffBlacklistRoles: {}, staffBlacklistHistory: [], botProfile: {}, aliases: {} };
   data.staffBlacklistUsers ||= {};
   data.staffBlacklistRoles ||= {};
   data.staffBlacklistHistory ||= [];
+  data.botProfile ||= {};
   return data;
 };
 const embed = (title, description) => new EmbedBuilder().setTitle(title).setDescription(description).setFooter({ text: 'bot created by @6xwg / kutt' }).setTimestamp();
@@ -65,12 +66,12 @@ const commandList = [
   ['-strike @user <reason>', 'Add a strike; third strike removes permission roles'], ['-st @user <reason>', 'Alias for strike'], ['-rmstrike @user <reason>', 'Remove the latest strike'],
   ['-rmst @user <reason>', 'Alias for rmstrike'], ['-clearstrikes @user <reason>', 'Clear every current strike'], ['-strikelist', 'List current strikes, six people per page'],
   ['-protect @user|role|ID', 'Protect a user or role from role removal'], ['-rmprotection @user|role|ID', 'Remove protection'], ['-view @user|role|ID', 'Show protection, strikes, roles, and tenure'],
-  ['-setstaff @role|ID', 'Set the required staff role (owner only)'], ['-resetstaffrole', 'Clear the staff role so it can be reconfigured (owner only)'], ['-staffblacklist @user|role|ID <reason>', 'Blacklist staff permissions with a required reason'], ['-rmstaffblacklist @user|role|ID <reason>', 'Remove a staff blacklist with a required reason'], ['-staffblacklistlist', 'List active and removed blacklist history'], ['-viewaliases', 'Show every command alias'], ['-botclear', 'Clear the last 20 user/bot response messages']
+  ['-setstaff @role|ID', 'Set the required staff role (owner only)'], ['-resetstaffrole', 'Clear the staff role so it can be reconfigured (owner only)'], ['-staffblacklist @user|role|ID <reason>', 'Blacklist staff permissions with a required reason'], ['-rmstaffblacklist @user|role|ID <reason>', 'Remove a staff blacklist with a required reason'], ['-staffblacklistlist', 'List active and removed blacklist history'], ['-avatar <image URL>', 'Change the bot avatar (owner only)'], ['-banner <image URL>', 'Change the bot banner (owner only)'], ['-bio <text>', 'Save bot bio text (owner only; Discord API limitation)'], ['-viewaliases', 'Show every command alias'], ['-botclear', 'Clear the last 20 user/bot response messages']
 ];
 const menus = {
   moderation: [['strike', '-strike @user <reason>'], ['rmstrike', '-rmstrike @user <reason>'], ['strikelist', '-strikelist'], ['clearstrikes', '-clearstrikes @user <reason>'], ['staffblacklist', '-staffblacklist @user|role|ID <reason>'], ['rmstaffblacklist', '-rmstaffblacklist @user|role|ID <reason>'], ['staffblacklistlist', '-staffblacklistlist'], ['view', '-view @user|role|ID']],
   protection: [['protect', '-protect @user|role|ID'], ['rmprotection', '-rmprotection @user|role|ID']],
-  owner: [['setstaff', '-setstaff @role|ID'], ['resetstaffrole', '-resetstaffrole'], ['setlogs protected', '-setlogs protected #channel|ID'], ['setlogs strike', '-setlogs strike #channel|ID'], ['setlogs main', '-setlogs main #channel|ID']]
+  owner: [['setstaff', '-setstaff @role|ID'], ['resetstaffrole', '-resetstaffrole'], ['setlogs protected', '-setlogs protected #channel|ID'], ['setlogs strike', '-setlogs strike #channel|ID'], ['setlogs main', '-setlogs main #channel|ID'], ['avatar', '-avatar <image URL>'], ['banner', '-banner <image URL>'], ['bio', '-bio <text>']]
 };
 const dashboard = (index = 0) => {
   const total = Math.ceil(commandList.length / 6);
@@ -104,8 +105,28 @@ client.on('messageCreate', async message => {
   if (command === 'commands' || command === 'cmds') return message.reply(dashboard());
   if (command === 'logs') return reply(message, 'Configured logs', `Strike: ${mentionChannel(message.guild, data.logs.strike)}\nProtected: ${mentionChannel(message.guild, data.logs.protected)}\nMain: ${mentionChannel(message.guild, data.logs.main)}`);
   if (command === 'viewaliases') return reply(message, 'Aliases', '`-cmds` = `-commands`\n`-st` = `-strike`\n`-rmst` = `-rmstrike`');
-  if (['setlogs', 'setstaff', 'resetstaffrole'].includes(command) && !isOwner(message)) return reply(message, 'Owner only', 'Only the guild owner can change bot configuration.');
-  if (!['commands', 'cmds', 'logs', 'viewaliases', 'setlogs', 'setstaff', 'resetstaffrole'].includes(command) && !isStaff(message)) return reply(message, 'Access denied', 'You need the configured staff role to use this bot.');
+  const profileCommands = ['avatar', 'banner', 'bio'];
+  if ([...profileCommands, 'setlogs', 'setstaff', 'resetstaffrole'].includes(command) && !isOwner(message)) return reply(message, 'Owner only', 'Only the guild owner can change bot configuration.');
+  if (profileCommands.includes(command)) {
+    const value = args.join(' ').trim();
+    if (!value) return reply(message, 'Value required', `Usage: \'-${command} ${command === 'bio' ? '<text>' : '<image URL>'}\'`);
+    if (command === 'bio') {
+      data.botProfile.bio = value; save();
+      return reply(message, 'Bio saved', 'The requested bio was saved. Discord does not currently expose bot bio editing through its bot API, so it cannot be applied to the public bot profile.');
+    }
+    let url;
+    try { url = new URL(value); } catch { return reply(message, 'Invalid image URL', `Usage: \'-${command} <https image URL>\'`); }
+    if (!['http:', 'https:'].includes(url.protocol)) return reply(message, 'Invalid image URL', 'The image must use an HTTP or HTTPS URL.');
+    try {
+      if (command === 'avatar') await client.user.setAvatar(url.toString());
+      else await client.user.setBanner(url.toString());
+    } catch (error) {
+      return reply(message, `${command} update failed`, 'Discord rejected that image. Check the URL, image format, size, and try again.');
+    }
+    data.botProfile[command] = url.toString(); save();
+    return reply(message, `${command} updated`, `The bot ${command} was updated successfully.`);
+  }
+  if (!['commands', 'cmds', 'logs', 'viewaliases', 'setlogs', 'setstaff', 'resetstaffrole', ...profileCommands].includes(command) && !isStaff(message)) return reply(message, 'Access denied', 'You need the configured staff role to use this bot.');
   if (command === 'botclear') {
     if (!message.channel.permissionsFor(message.guild.members.me).has(PermissionFlagsBits.ManageMessages)) return reply(message, 'Cleanup unavailable', 'The bot needs Manage Messages in this channel.');
     const messages = await message.channel.messages.fetch({ limit: 100 });

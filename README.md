@@ -25,6 +25,8 @@ Staff can use `-staffblacklist @user|role|ID <reason>` and `-rmstaffblacklist @u
 
 Use `-staffblacklistlist` to review active blacklist entries and removed blacklist history, with six entries per page and button navigation.
 
+The guild owner can use `-avatar <image URL>` and `-banner <image URL>` to update the bot profile. `-bio <text>` saves the requested bio text, but Discord currently does not provide a bot API for changing a bot's public profile bio.
+
 ## Important Discord limitation
 
 Protection restoration depends on the bot’s role hierarchy and audit-log access. Discord does not expose the executor directly in `guildMemberUpdate`, so the bot restores protected roles whenever it detects they are missing. Keep the bot above protected roles and do not give it a role that outranks the server owner.
