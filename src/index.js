@@ -23,9 +23,10 @@ const isAdminRole = role => role && !role.managed && role.permissions.any(Permis
 const roleResolver = (guild, input) => guild.roles.cache.get(input?.replace(/[<@&>]/g, '')) || guild.roles.cache.find(role => role.name.toLowerCase() === input?.toLowerCase());
 const userResolver = async (message, token) => message.mentions.users.first() || await message.client.users.fetch(token?.replace(/[<@!>]/g, '')).catch(() => null);
 const parseTargetReason = async message => {
-  const token = message.content.trim().split(/\s+/)[1];
+  const parts = message.content.trim().split(/\s+/);
+  const token = parts[1];
   const target = await userResolver(message, token);
-  const reason = message.content.replace(new RegExp(`^\\${PREFIX}\\S+\\s+<@!?${target?.id || 'x'}>\\s*`, 'i'), '').trim() || 'No reason provided.';
+  const reason = parts.slice(2).join(' ').trim();
   return { target, reason };
 };
 const log = async (guild, kind, title, text) => {
@@ -109,7 +110,7 @@ client.on('messageCreate', async message => {
   }
   if (command === 'strike' || command === 'st' || command === 'rmstrike' || command === 'rmst' || command === 'clearstrikes') {
     const { target, reason } = await parseTargetReason(message);
-    if (!target) return reply(message, 'Invalid target', 'Usage: `-strike @user <reason>`');
+    if (!target || !reason) return reply(message, 'Reason required', 'A reason is required. Usage: `-' + (command === 'rmst' ? 'rmstrike' : command === 'st' ? 'strike' : command) + ' @user <reason>`');
     if (target.id === message.author.id) return reply(message, 'Strike blocked', 'You cannot strike yourself.');
     const staffRoleId = data.staffRoleId;
     if (staffRoleId && target.id !== message.guild.ownerId && (message.guild.members.cache.get(target.id)?.roles.cache.has(staffRoleId))) return reply(message, 'Strike blocked', 'You cannot strike someone who has the configured staff role.');
