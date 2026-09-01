@@ -193,9 +193,8 @@ client.on('messageCreate', async message => {
           .setColor(0x5865F2)
           .addFields(
             { name: 'members:', value: `${memberStats.total}`, inline: true },
-            { name: 'humans:', value: `${memberStats.humans}`, inline: true },
             { name: 'bots:', value: `${memberStats.bots}`, inline: true },
-            { name: 'new in 24h:', value: `${memberStats.newIn24h}`, inline: true }
+            { name: 'recent members joined:', value: `${memberStats.newIn24h}`, inline: true }
           )
       ]
     });
