@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { ensurePermissions, getLevel, canUseCommand, configureLevel, setCommands } = require('../src/permissions');
+const { ensurePermissions, getLevel, canUseCommand, getEffectivePermissions, configureLevel, configurePaid, setCommands } = require('../src/permissions');
 
 function member(id, ownerId, roles = []) {
   return { id, guild: { ownerId }, roles: { cache: new Map(roles.map(roleId => [roleId, { id: roleId }])) } };
@@ -26,4 +26,16 @@ test('lower hierarchy levels require explicit command grants', () => {
   assert.equal(canUseCommand(data, member('mod', 'owner'), 'vc'), false);
   assert.equal(canUseCommand(data, member('owner', 'owner'), 'vc'), true);
   assert.equal(ensurePermissions(data).admins.commands, undefined);
+});
+
+test('Paid user and role access combines with staff access without overwriting entries', () => {
+  const data = {};
+  configureLevel(data, 'staff', 'user', 'staff-user');
+  setCommands(data, 'staff', ['strike']);
+  configurePaid(data, 'role', 'paid-a', ['vc follow'], 'owner');
+  configurePaid(data, 'role', 'paid-b', ['vc bring'], 'owner');
+  configurePaid(data, 'user', 'staff-user', ['vc inspect'], 'owner');
+  const effective = getEffectivePermissions(data, member('staff-user', 'owner', ['paid-a', 'paid-b']));
+  assert.deepEqual(new Set(effective.commands), new Set(['strike', 'vc follow', 'vc bring', 'vc inspect']));
+  assert.equal(data.permissions.paid.length, 3);
 });

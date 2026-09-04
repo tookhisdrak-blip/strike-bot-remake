@@ -7,6 +7,7 @@ function ensurePermissions(data) {
     moderators: { roles: [], users: [], commands: [] },
     staff: { roles: [], users: [], commands: [] },
     admins: { roles: [], users: [] },
+    paid: [],
   };
   permissions.configured = Boolean(permissions.configured);
   for (const level of ['moderators', 'staff', 'admins']) {
@@ -15,6 +16,7 @@ function ensurePermissions(data) {
     permissions[level].users ||= [];
     if (level !== 'admins') permissions[level].commands ||= [];
   }
+  permissions.paid ||= [];
   return permissions;
 }
 
@@ -35,10 +37,63 @@ function getLevel(data, member) {
 }
 
 function canUseCommand(data, member, commandName) {
-  const level = getLevel(data, member);
-  if (level === 'owner' || level === 'admin') return true;
-  if (!level) return false;
-  return ensurePermissions(data)[storageKey(level)].commands.includes(commandName);
+  const effective = getEffectivePermissions(data, member);
+  if (effective.levels.includes('owner') || effective.levels.includes('admin')) return true;
+  if (effective.commands.includes(commandName)) return true;
+  return false;
+}
+
+function getEffectivePermissions(data, member) {
+  const permissions = ensurePermissions(data);
+  const commands = new Set();
+  const sources = {};
+  const levels = member?.guild?.ownerId === member?.id ? ['owner'] : [];
+  for (const [key, label] of [['admins', 'admin'], ['staff', 'staff'], ['moderators', 'moderator']]) {
+    if (hasIdentity(member, permissions[key])) levels.push(label);
+  }
+  if (levels.includes('owner') || levels.includes('admin')) return { levels: [...new Set(levels)], commands: [], sources, fullAccess: true };
+  for (const candidate of ['staff', 'moderator']) {
+    if (levels.includes(candidate)) {
+      for (const command of permissions[storageKey(candidate)].commands) { commands.add(command); sources[command] ||= `${candidate} configuration`; }
+    }
+  }
+  for (const entry of permissions.paid) {
+    const matches = entry.targetType === 'user' ? entry.targetId === member?.id : member?.roles?.cache?.has(entry.targetId);
+    if (!matches) continue;
+    levels.push('paid');
+    for (const command of entry.commands || []) { commands.add(command); sources[command] ||= entry.targetType === 'role' ? 'Paid role' : 'Direct paid user'; }
+  }
+  return { levels: [...new Set(levels)], commands: [...commands], sources, fullAccess: false };
+}
+
+function getHierarchy(data) {
+  const permissions = ensurePermissions(data);
+  return {
+    owner: true,
+    admin: permissions.admins,
+    staff: permissions.staff,
+    moderator: permissions.moderators,
+    paid: permissions.paid,
+  };
+}
+
+function configurePaid(data, targetType, targetId, commands, actorId, now = new Date().toISOString()) {
+  const permissions = ensurePermissions(data);
+  const existing = permissions.paid.find(entry => entry.targetType === targetType && entry.targetId === targetId);
+  const record = existing || { guildId: data.guildId || null, targetType, targetId, commands: [], configuredBy: actorId, createdAt: now };
+  record.commands = [...new Set(commands.filter(Boolean))];
+  record.configuredBy ||= actorId;
+  record.updatedAt = now;
+  if (!existing) permissions.paid.push(record);
+  permissions.configured = true;
+  return record;
+}
+
+function removePaid(data, targetType, targetId) {
+  const permissions = ensurePermissions(data);
+  const before = permissions.paid.length;
+  permissions.paid = permissions.paid.filter(entry => !(entry.targetType === targetType && entry.targetId === targetId));
+  return before !== permissions.paid.length;
 }
 
 function configureLevel(data, level, targetType, targetId) {
@@ -58,4 +113,4 @@ function setCommands(data, level, commands) {
   return permissions;
 }
 
-module.exports = { LEVELS, ensurePermissions, getLevel, canUseCommand, configureLevel, setCommands };
+module.exports = { LEVELS, ensurePermissions, getLevel, canUseCommand, getEffectivePermissions, getHierarchy, configureLevel, setCommands, configurePaid, removePaid };

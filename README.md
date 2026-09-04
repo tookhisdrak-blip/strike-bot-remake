@@ -21,6 +21,8 @@ Run `-help`, `-commands`, or `-cmds` for the interactive command dashboard. It c
 
 The guild owner can run `-botsetup` to configure the bot-managed hierarchy. Before setup, the guild owner is the only user with bot management access. Admin identities receive all bot commands; Staff and Moderators receive only commands selected during setup. Roles and individual users are stored by ID.
 
+Use `-setpaid @role|@user|ID` to configure command-specific Paid access, and `-options` to view the caller's effective access. Authorized users can use `-levels` to inspect the complete server-wide hierarchy and configured targets.
+
 Voice management is available through `-vc` actions including `follow`, `unfollow`, `chain`, `bring`, `inspect`, `godmode`, `ungodmode`, `muteall`, `unmuteall`, `dragall`, `voicehistory`, `forceownership`, and `voiceoverride`. `-stfu` and `-unstfu` provide persistent server-mute enforcement.
 
 The dashboard shows six commands per page. Use the dropdown to switch groups and the Previous/Next buttons to browse without rerunning the command. Staff can use `-botclear` to remove up to 20 recent messages from themselves and this bot in the current channel; the bot needs `Manage Messages`.
