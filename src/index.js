@@ -3,7 +3,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const {
   Client, GatewayIntentBits, Partials, EmbedBuilder, ActionRowBuilder,
-  ButtonBuilder, ButtonStyle, StringSelectMenuBuilder, ChannelSelectMenuBuilder, PermissionFlagsBits,
+  ButtonBuilder, ButtonStyle, StringSelectMenuBuilder, ChannelSelectMenuBuilder, RoleSelectMenuBuilder, UserSelectMenuBuilder, PermissionFlagsBits,
   AuditLogEvent, ChannelType, Role
 } = require('discord.js');
 const {
@@ -15,6 +15,8 @@ const {
   applyRoleGodmodeToMember,
 } = require('./godmode');
 const { isPermissionRole, collectProtectedRoleIds, getProtectedRoleTargetsForMember, canRemoveProtectedRole } = require('./protection');
+const { ensurePermissions, getLevel, canUseCommand, configureLevel, setCommands } = require('./permissions');
+const { ensureVoice, addHistory, setFollow, removeFollow, setChain } = require('./voice');
 const { getVoiceStats, getMemberStats } = require('./stats');
 
 const PREFIX = process.env.PREFIX || '-';
@@ -27,11 +29,13 @@ let godmodeDb = fs.existsSync(godmodeFile) ? JSON.parse(fs.readFileSync(godmodeF
 const save = () => fs.writeFileSync(file, JSON.stringify(db, null, 2));
 const saveGodmode = () => fs.writeFileSync(godmodeFile, JSON.stringify(godmodeDb, null, 2));
 const guildData = guild => {
-  const data = db[guild.id] ||= { strikes: {}, strikeHistory: [], removedStrikes: {}, logs: {}, staffRoleId: null, protectedUsers: {}, protectedRoles: {}, protection: {}, stfu: {}, stfuHistory: [], staffBlacklistUsers: {}, staffBlacklistRoles: {}, staffBlacklistHistory: [], botProfile: {}, aliases: {} };
+  const data = db[guild.id] ||= { strikes: {}, strikeHistory: [], removedStrikes: {}, logs: {}, staffRoleId: null, protectedUsers: {}, protectedRoles: {}, protection: {}, stfu: {}, stfuHistory: [], voice: {}, permissions: {}, staffBlacklistUsers: {}, staffBlacklistRoles: {}, staffBlacklistHistory: [], botProfile: {}, aliases: {} };
   data.strikeHistory ||= [];
   data.protection ||= {};
   data.stfu ||= {};
   data.stfuHistory ||= [];
+  ensurePermissions(data);
+  ensureVoice(data);
   data.staffBlacklistUsers ||= {};
   data.staffBlacklistRoles ||= {};
   data.staffBlacklistHistory ||= [];
@@ -43,6 +47,7 @@ const reply = (message, title, description, extra = {}) => message.reply({ embed
 const mentionChannel = (guild, id) => id ? guild.channels.cache.get(id)?.toString() || `<#${id}>` : 'not configured';
 const isOwner = message => message.guild.ownerId === message.author.id;
 const isStaff = message => isOwner(message) || Boolean(guildData(message.guild).staffRoleId && message.member.roles.cache.has(guildData(message.guild).staffRoleId));
+const canManage = (message, commandName) => canUseCommand(guildData(message.guild), message.member, commandName);
 const protectionConfig = data => ({ enabled: true, protectionType: 'both', automaticRestore: true, attemptThreshold: 4, attemptWindow: 30, punishment: 'strip', logChannel: data.logs.protected || null, configured: false, ...data.protection });
 const protectionTypeAllows = (config, isRole) => !config.configured || config.protectionType === 'both' || (isRole ? config.protectionType === 'roles' : config.protectionType === 'users');
 const isAdminRole = role => role && !role.managed && role.permissions.any(PermissionFlagsBits.Administrator | PermissionFlagsBits.ManageGuild | PermissionFlagsBits.ManageRoles | PermissionFlagsBits.BanMembers | PermissionFlagsBits.KickMembers);
@@ -152,6 +157,25 @@ const page = (title, items, index, total, makeText, idPrefix = 'page') => {
   return { embeds: [embed(title, `${body}\n\nPage ${index + 1}/${Math.max(total, 1)}`)], components: [row] };
 };
 
+const hierarchyCommands = ['strike', 'rmstrike', 'clearstrikes', 'strikelist', 'view', 'protect', 'rmprotection', 'stfu', 'unstfu', 'vc'];
+const permissionStoreKey = level => level === 'staff' ? 'staff' : `${level}s`;
+const botSetupView = (ownerId, state) => {
+  const permissions = state.permissions;
+  const level = state.level;
+  const commands = !level ? 'Choose a level' : level === 'admin' ? 'All commands' : (permissions[permissionStoreKey(level)].commands.join(', ') || 'None selected');
+  const identity = state.targetType ? `${state.targetType}: ${state.targetId || 'select one'}` : 'Not selected';
+  const rows = [];
+  if (state.step === 'welcome') rows.push(new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`bs:${ownerId}:start`).setLabel('Start Setup').setStyle(ButtonStyle.Primary), new ButtonBuilder().setCustomId(`bs:${ownerId}:cancel`).setLabel('Cancel').setStyle(ButtonStyle.Secondary)));
+  if (state.step === 'level') rows.push(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId(`bs:${ownerId}:level`).setPlaceholder('Select access level').addOptions({ label: 'Moderator', value: 'moderator' }, { label: 'Staff', value: 'staff' }, { label: 'Admin', value: 'admin' })));
+  if (state.step === 'targetType') rows.push(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId(`bs:${ownerId}:targetType`).setPlaceholder('Select role or user').addOptions({ label: 'Role', value: 'role' }, { label: 'User', value: 'user' })));
+  if (state.step === 'target') rows.push(new ActionRowBuilder().addComponents(state.targetType === 'role' ? new RoleSelectMenuBuilder().setCustomId(`bs:${ownerId}:target`) : new UserSelectMenuBuilder().setCustomId(`bs:${ownerId}:target`)));
+  if (state.step === 'commands') rows.push(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId(`bs:${ownerId}:commands`).setPlaceholder('Select allowed commands').setMinValues(0).setMaxValues(Math.min(25, hierarchyCommands.length)).addOptions(hierarchyCommands.map(command => ({ label: command, value: command })))));
+  if (state.step === 'confirm') rows.push(new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`bs:${ownerId}:confirm`).setLabel('Confirm').setStyle(ButtonStyle.Success), new ButtonBuilder().setCustomId(`bs:${ownerId}:back`).setLabel('Back').setStyle(ButtonStyle.Secondary), new ButtonBuilder().setCustomId(`bs:${ownerId}:cancel`).setLabel('Cancel').setStyle(ButtonStyle.Danger)));
+  if (state.step !== 'welcome' && state.step !== 'confirm') rows.push(new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`bs:${ownerId}:cancel`).setLabel('Cancel').setStyle(ButtonStyle.Danger)));
+  const description = state.step === 'welcome' ? 'Configure who can access your bot and which commands they may use.' : `Level: **${level}**\nTarget: **${identity}**\nCommands: **${commands}**`;
+  return { embeds: [embed('Bot setup', description)], components: rows };
+};
+
 const setupView = (ownerId, state, existing = false) => {
   const config = state.config;
   const summary = `Status: **${config.enabled ? 'Enabled' : 'Disabled'}**\nProtection: **${config.protectionType}**\nRestoration: **${config.automaticRestore ? 'Automatic' : 'Log only'}**\nAttack threshold: **${config.attemptThreshold} / ${config.attemptWindow}s**\nPunishment: **${config.punishment}**\nLog channel: **${config.logChannel ? `<#${config.logChannel}>` : 'Not configured'}**`;
@@ -205,27 +229,31 @@ const commandList = [
   ['-strike @user <reason>', 'Add a strike; third strike removes permission roles'], ['-st @user <reason>', 'Alias for strike'], ['-rmstrike @user <reason>', 'Remove the latest strike'],
   ['-rmst @user <reason>', 'Alias for rmstrike'], ['-clearstrikes @user <reason>', 'Clear every current strike'], ['-strikelist', 'List current strikes, six people per page'],
   ['-protect @user|role|ID', 'Protect a user or role from role removal'], ['-rmprotection @user|role|ID', 'Remove protection'], ['-plist', 'List all protected users and protected roles'], ['-view @user|role|ID', 'Show protection, strikes, roles, and tenure'],
-  ['-setupprotection', 'Configure protection (owner only)'], ['-godmode enable|disable|@user|@role', 'Protect against mute, deafen, and role changes'], ['-stfu @user [reason]', 'Persistently server-mute a user'], ['-unstfu @user', 'Remove persistent server mute'],
-  ['-setstaff @role|ID', 'Set the required staff role (owner only)'], ['-resetstaffrole', 'Clear the staff role so it can be reconfigured (owner only)'], ['-staffblacklist @user|role|ID <reason>', 'Blacklist staff permissions with a required reason'], ['-rmstaffblacklist @user|role|ID <reason>', 'Remove a staff blacklist with a required reason'], ['-staffblacklistlist', 'List active and removed blacklist history'], ['-avatar <image URL>', 'Change the bot avatar (owner only)'], ['-banner <image URL>', 'Change the bot banner (owner only)'], ['-bio <text>', 'Save bot bio text (owner only; Discord API limitation)'], ['-viewaliases', 'Show every command alias'], ['-botclear', 'Clear the last 20 user/bot response messages']
+  ['-setupprotection', 'Configure protection (owner only)'], ['-godmode enable|disable|@user|@role', 'Protect against mute, deafen, and role changes'], ['-stfu @user [reason]', 'Persistently server-mute a user'], ['-unstfu @user', 'Remove persistent server mute'], ['-vc <action>', 'Manage voice channels and users'],
+  ['-botsetup', 'Configure bot permission hierarchy (owner only)'], ['-setmod @role|@user', 'Configure moderator access (owner only)'], ['-setstaff @role|@user', 'Configure staff access (owner only)'], ['-setadmin @role|@user', 'Configure admin access (owner only)'], ['-resetstaffrole', 'Clear the legacy staff role setting (owner only)'], ['-staffblacklist @user|role|ID <reason>', 'Blacklist staff permissions with a required reason'], ['-rmstaffblacklist @user|role|ID <reason>', 'Remove a staff blacklist with a required reason'], ['-staffblacklistlist', 'List active and removed blacklist history'], ['-avatar <image URL>', 'Change the bot avatar (owner only)'], ['-banner <image URL>', 'Change the bot banner (owner only)'], ['-bio <text>', 'Save bot bio text (owner only; Discord API limitation)'], ['-viewaliases', 'Show every command alias'], ['-botclear', 'Clear the last 20 user/bot response messages']
 ];
 const menus = {
   moderation: [['strike', '-strike @user <reason>'], ['rmstrike', '-rmstrike @user <reason>'], ['strikelist', '-strikelist'], ['clearstrikes', '-clearstrikes @user <reason>'], ['staffblacklist', '-staffblacklist @user|role|ID <reason>'], ['rmstaffblacklist', '-rmstaffblacklist @user|role|ID <reason>'], ['staffblacklistlist', '-staffblacklistlist'], ['view', '-view @user|role|ID']],
   protection: [['setupprotection', '-setupprotection'], ['protect', '-protect @user|role|ID'], ['rmprotection', '-rmprotection @user|role|ID'], ['plist', '-plist'], ['godmode', '-godmode enable|disable|@user|@role']],
-  voice: [['stfu', '-stfu @user [reason]'], ['unstfu', '-unstfu @user']],
+  voice: [['follow', '-vc follow @user'], ['unfollow', '-vc unfollow @user'], ['chain', '-vc chain @user @user ...'], ['bring', '-vc bring @user'], ['inspect', '-vc inspect @user'], ['godmode', '-vc godmode @user'], ['ungodmode', '-vc ungodmode @user'], ['muteall', '-vc muteall'], ['unmuteall', '-vc unmuteall'], ['dragall', '-vc dragall #channel'], ['voicehistory', '-vc voicehistory @user'], ['forceownership', '-vc forceownership @user'], ['voiceoverride', '-vc voiceoverride'], ['stfu', '-stfu @user [reason]'], ['unstfu', '-unstfu @user']],
+  configuration: [['botsetup', '-botsetup'], ['setmod', '-setmod @role|@user'], ['setstaff', '-setstaff @role|@user'], ['setadmin', '-setadmin @role|@user'], ['setlogs', '-setlogs strike|protected|main #channel'], ['logs', '-logs']],
   owner: [['setstaff', '-setstaff @role|ID'], ['resetstaffrole', '-resetstaffrole'], ['setlogs protected', '-setlogs protected #channel|ID'], ['setlogs strike', '-setlogs strike #channel|ID'], ['setlogs main', '-setlogs main #channel|ID'], ['avatar', '-avatar <image URL>'], ['banner', '-banner <image URL>'], ['bio', '-bio <text>']]
 };
 const dashboard = (index = 0) => {
   const total = Math.ceil(commandList.length / 6);
   const commands = commandList.slice(index * 6, index * 6 + 6).map(([usage, description]) => `**${usage}**\n${description}`).join('\n\n');
   const select = new StringSelectMenuBuilder().setCustomId('menu:commands').setPlaceholder('Choose a command group').addOptions(
+    { label: 'Overview', value: 'overview', description: 'Return to the command overview' },
     { label: 'Moderation', value: 'moderation', description: 'Strike and review staff' },
     { label: 'Protection', value: 'protection', description: 'Protect users and roles' },
-    { label: 'Voice moderation', value: 'voice', description: 'Persistent server mute controls' },
+    { label: 'Voice moderation', value: 'voice', description: 'Voice management commands' },
+    { label: 'Configuration', value: 'configuration', description: 'Bot hierarchy and logs' },
     { label: 'Server owner', value: 'owner', description: 'Server-only configuration' }
   );
   const navigation = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`commands:page:${index - 1}`).setLabel('Previous').setStyle(ButtonStyle.Secondary).setDisabled(index === 0),
-    new ButtonBuilder().setCustomId(`commands:page:${index + 1}`).setLabel('Next').setStyle(ButtonStyle.Secondary).setDisabled(index >= total - 1)
+    new ButtonBuilder().setCustomId(`commands:page:${index + 1}`).setLabel('Next').setStyle(ButtonStyle.Secondary).setDisabled(index >= total - 1),
+    new ButtonBuilder().setCustomId('commands:home').setLabel('Home').setStyle(ButtonStyle.Secondary)
   );
   return { embeds: [embed('Strike bot commands', `${commands}\n\nPage ${index + 1}/${total}`)], components: [new ActionRowBuilder().addComponents(select), navigation] };
 };
@@ -235,6 +263,7 @@ const cooldowns = new Map();
 const protectionAttempts = new Map();
 const protectionRestorations = new Set();
 const protectionSetups = new Map();
+const botSetups = new Map();
 const godmodeProcessing = new Map();
 const stfuProcessing = new Set();
 const enforceStfu = async member => {
@@ -266,16 +295,22 @@ client.on('messageCreate', async message => {
   if (!command) return;
   const data = guildData(message.guild);
   if (command === 'help' || command === 'commands' || command === 'cmds') {
-    if (!isStaff(message)) return reply(message, 'Access denied', 'You need the configured staff role to use this bot.');
+    if (!canManage(message, 'help')) return reply(message, 'Access denied', 'You do not have permission to use this command.');
     return message.reply(dashboard());
   }
   if (command === 'logs') {
-    if (!isStaff(message)) return reply(message, 'Access denied', 'You need the configured staff role to use this bot.');
+    if (!canManage(message, 'logs')) return reply(message, 'Access denied', 'You do not have permission to use this command.');
     return reply(message, 'Configured logs', `Strike: ${mentionChannel(message.guild, data.logs.strike)}\nProtected: ${mentionChannel(message.guild, data.logs.protected)}\nMain: ${mentionChannel(message.guild, data.logs.main)}`);
   }
   if (command === 'viewaliases') {
-    if (!isStaff(message)) return reply(message, 'Access denied', 'You need the configured staff role to use this bot.');
+    if (!canManage(message, 'viewaliases')) return reply(message, 'Access denied', 'You do not have permission to use this command.');
     return reply(message, 'Aliases', '`-cmds` = `-commands`\n`-st` = `-strike`\n`-rmst` = `-rmstrike`');
+  }
+  if (command === 'botsetup') {
+    if (!isOwner(message)) return reply(message, 'Owner only', 'Only the guild owner can configure bot permissions.');
+    const state = { step: 'welcome', permissions: JSON.parse(JSON.stringify(ensurePermissions(data))) };
+    botSetups.set(`${message.guild.id}:${message.author.id}`, state);
+    return message.reply(botSetupView(message.author.id, state));
   }
   if (command === 'setupprotection') {
     if (!isOwner(message)) return reply(message, 'Owner only', 'Only the guild owner can configure protection.');
@@ -312,7 +347,7 @@ client.on('messageCreate', async message => {
     });
   }
   const profileCommands = ['avatar', 'banner', 'bio'];
-  if ([...profileCommands, 'setlogs', 'setstaff', 'resetstaffrole'].includes(command) && !isOwner(message)) return reply(message, 'Owner only', 'Only the guild owner can change bot configuration.');
+  if ([...profileCommands, 'botsetup', 'setmod', 'setstaff', 'setadmin', 'setlogs', 'resetstaffrole'].includes(command) && !isOwner(message)) return reply(message, 'Owner only', 'Only the guild owner can change bot configuration.');
   if (profileCommands.includes(command)) {
     const value = args.join(' ').trim();
     if (!value) return reply(message, 'Value required', `Usage: \'-${command} ${command === 'bio' ? '<text>' : '<image URL>'}\'`);
@@ -332,7 +367,7 @@ client.on('messageCreate', async message => {
     data.botProfile[command] = url.toString(); save();
     return reply(message, `${command} updated`, `The bot ${command} was updated successfully.`);
   }
-  if (!['help', 'commands', 'cmds', 'logs', 'viewaliases', 'setupprotection', 'setlogs', 'setstaff', 'resetstaffrole', ...profileCommands].includes(command) && !isStaff(message)) return reply(message, 'Access denied', 'You need the configured staff role to use this bot.');
+  if (!['help', 'commands', 'cmds', 'logs', 'viewaliases', 'botsetup', 'setupprotection', 'setmod', 'setstaff', 'setadmin', 'setlogs', 'resetstaffrole', ...profileCommands].includes(command) && !canManage(message, command)) return reply(message, 'Access denied', 'You do not have permission to use this command.');
   if (command === 'botclear') {
     if (!message.channel.permissionsFor(message.guild.members.me).has(PermissionFlagsBits.ManageMessages)) return reply(message, 'Cleanup unavailable', 'The bot needs Manage Messages in this channel.');
     const messages = await message.channel.messages.fetch({ limit: 100 });
@@ -354,7 +389,7 @@ client.on('messageCreate', async message => {
       saveGodmode();
       return reply(message, 'Godmode disabled', removed ? 'Godmode disabled.' : 'Godmode was not enabled for you.');
     }
-    const hasGrantPermission = isOwner(message) || isStaff(message);
+    const hasGrantPermission = canManage(message, 'godmode');
     if (!hasGrantPermission) return reply(message, 'Permission denied', 'You do not have permission to grant Godmode.');
     const target = message.mentions.members.first() || message.mentions.roles.first() || roleResolver(message.guild, args[0]) || await userResolver(message, args[0]);
     if (!target) return reply(message, 'Invalid target', 'Usage: `-godmode @user` or `-godmode @role`');
@@ -372,6 +407,16 @@ client.on('messageCreate', async message => {
     saveGodmode();
     return reply(message, 'Godmode granted to @user', `Godmode granted to ${target}.`);
   }
+  if (['setmod', 'setstaff', 'setadmin'].includes(command)) {
+    const target = message.mentions.roles.first() || roleResolver(message.guild, args[0]) || message.mentions.users.first() || await userResolver(message, args[0]);
+    if (!target) return reply(message, 'Invalid target', `Usage: ${PREFIX}${command} @role|@user|ID`);
+    const level = command === 'setmod' ? 'moderator' : command === 'setadmin' ? 'admin' : 'staff';
+    const targetType = target instanceof Role || target.constructor?.name === 'Role' ? 'role' : 'user';
+    configureLevel(data, level, targetType, target.id);
+    save();
+    await log(message.guild, 'main', 'Bot permission configured', `${target} was added to ${level} access by ${message.author}.`);
+    return reply(message, `${level} configured`, `${target} now has ${level} access. Use ${PREFIX}botsetup to choose command access.`);
+  }
   if (command === 'stfu' || command === 'unstfu') {
     const target = message.mentions.members.first() || await message.guild.members.fetch(args[0]?.replace(/[<@!>]/g, '')).catch(() => null);
     if (!target || target.user.bot) return reply(message, 'Invalid target', 'Usage: `-stfu @user [reason]`');
@@ -388,10 +433,50 @@ client.on('messageCreate', async message => {
     if (!message.guild.members.me?.permissions.has(PermissionFlagsBits.MuteMembers) || !target.manageable) return reply(message, 'Action unavailable', 'I cannot manage that member because of missing Mute Members permission or role hierarchy.');
     const reason = args.slice(1).join(' ').trim() || 'No reason provided';
     const record = { guildId: message.guild.id, targetId: target.id, executorId: message.author.id, reason, timestamp: new Date().toISOString(), active: true };
-    data.stfu[target.id] = record; save();
-    if (target.voice?.channel) await target.voice.setMute(true, `STFU: ${reason}`).catch(() => {});
+    data.stfu[target.id] = record;
+    if (target.voice?.channel) {
+      const muted = await target.voice.setMute(true, `STFU: ${reason}`).then(() => true).catch(() => false);
+      if (!muted) { delete data.stfu[target.id]; save(); return reply(message, 'STFU unavailable', 'Discord rejected the server mute, so STFU was not activated.'); }
+    }
+    save();
     await log(message.guild, 'protected', 'STFU applied', `${target} was server-muted by ${message.author}. Reason: ${reason}`);
     return reply(message, 'STFU applied', `${target} will remain server-muted until ` + '```-unstfu @user```' + ' is used.');
+  }
+  if (command === 'vc') {
+    const action = args.shift()?.toLowerCase();
+    const voice = ensureVoice(data);
+    const target = message.mentions.members.first() || (args[0] && await message.guild.members.fetch(args[0].replace(/[<@!>]/g, '')).catch(() => null));
+    const current = message.member.voice.channel;
+    if (action === 'follow' && target) { setFollow(data, message.author.id, target.id); save(); return reply(message, 'VC follow enabled', `Following ${target}.`); }
+    if (action === 'unfollow') { removeFollow(data, message.author.id); save(); return reply(message, 'VC follow disabled', 'Voice follow stopped.'); }
+    if (action === 'chain') {
+      const members = [...message.mentions.members.values()];
+      if (members.length < 2) return reply(message, 'Invalid chain', 'Usage: `-vc chain @user @user ...`');
+      setChain(data, message.author.id, members.map(member => member.id)); save(); return reply(message, 'VC chain saved', `Saved a ${members.length}-member voice chain.`);
+    }
+    if (action === 'inspect' && target) return reply(message, 'Voice profile', `User: ${target}\nChannel: ${target.voice.channel ? `${target.voice.channel} (${target.voice.channel.id})` : 'not in voice'}\nServer mute: ${target.voice.serverMute ? 'yes' : 'no'}\nServer deafen: ${target.voice.serverDeaf ? 'yes' : 'no'}\nFollowed by: ${Object.entries(voice.follows).filter(([, id]) => id === target.id).map(([id]) => `<@${id}>`).join(', ') || 'none'}\nGodmode: ${hasGodmode(godmodeDb, message.guild.id, target.id) ? 'yes' : 'no'}\nSTFU: ${Boolean(data.stfu[target.id]?.active) ? 'yes' : 'no'}`);
+    if (action === 'bring' && target && current) { if (!target.movable) return reply(message, 'VC action unavailable', 'I cannot move that member because of role hierarchy.'); await target.voice.setChannel(current, 'VC bring').catch(() => null); return reply(message, 'Member moved', `${target} was moved to ${current}.`); }
+    if (action === 'dragall') {
+      const destination = message.mentions.channels.first() || message.guild.channels.cache.get(args[0]);
+      if (!destination?.isVoiceBased?.() || !current) return reply(message, 'VC action unavailable', 'Usage: `-vc dragall #voice-channel` while you are in voice.');
+      let moved = 0;
+      for (const member of current.members.values()) if (member.id !== client.user.id && member.movable && await member.voice.setChannel(destination, 'VC dragall').then(() => true).catch(() => false)) moved += 1;
+      await log(message.guild, 'main', 'VC dragall', `${message.author} moved ${moved} member(s) from ${current} to ${destination}.`); return reply(message, 'Members moved', `Moved ${moved} member(s) to ${destination}.`);
+    }
+    if ((action === 'muteall' || action === 'unmuteall') && current) {
+      const muted = action === 'muteall'; const eligible = current.members.filter(member => member.id !== client.user.id && member.manageable && (!data.stfu[member.id]?.active || muted));
+      for (const member of eligible.values()) await member.voice.setMute(muted, `VC ${action}`).catch(() => {});
+      await log(message.guild, 'main', `VC ${action}`, `${message.author} applied ${action} in ${current}.`); return reply(message, `VC ${action} complete`, `Updated ${eligible.size} member(s) in ${current}.`);
+    }
+    if (action === 'voicehistory' && target) { const entries = voice.history?.[target.id] || []; return reply(message, 'Voice history', entries.slice(0, 6).map(entry => `${entry.event || 'event'}: ${entry.channelId || 'none'} <t:${Math.floor(new Date(entry.at).getTime() / 1000)}:R>`).join('\n') || 'No voice history recorded.'); }
+    if (action === 'forceownership' && current && target) { const previous = voice.ownership[current.id]; voice.ownership[current.id] = target.id; save(); await log(message.guild, 'main', 'VC ownership changed', `${message.author} assigned ${current} to ${target}; previous owner: ${previous ? `<@${previous}>` : 'none'}.`); return reply(message, 'VC ownership assigned', `${target} now owns ${current}.`); }
+    if (action === 'voiceoverride') { voice.overrides[message.author.id] = { enabled: !voice.overrides[message.author.id]?.enabled, at: new Date().toISOString() }; save(); return reply(message, 'VC override updated', `Voice override is now ${voice.overrides[message.author.id].enabled ? 'enabled' : 'disabled'}.`); }
+    if (action === 'godmode' || action === 'ungodmode') {
+      if (!target) return reply(message, 'Invalid target', 'Usage: `-vc godmode @user`');
+      if (action === 'godmode') setGodmodeForUser(godmodeDb, message.guild.id, target.id, { grantedBy: message.author.id, source: 'vc', roleIds: [] }); else removeGodmodeForUser(godmodeDb, message.guild.id, target.id);
+      saveGodmode(); await log(message.guild, 'protected', `VC ${action}`, `${target} ${action} was requested by ${message.author}.`); return reply(message, `VC ${action}`, `${target} ${action} updated.`);
+    }
+    return reply(message, 'VC usage', 'Use `-vc follow`, `unfollow`, `chain`, `bring`, `inspect`, `godmode`, `ungodmode`, `muteall`, `unmuteall`, `voicehistory`, `forceownership`, or `voiceoverride` with a valid target.');
   }
   if (command === 'setstaff') {
     const role = roleResolver(message.guild, args[0]);
@@ -530,6 +615,30 @@ client.on('messageCreate', async message => {
 });
 
 client.on('interactionCreate', async interaction => {
+  if ((interaction.isButton() || interaction.isStringSelectMenu() || interaction.isRoleSelectMenu() || interaction.isUserSelectMenu()) && interaction.customId.startsWith('bs:')) {
+    const [, ownerId, action] = interaction.customId.split(':');
+    if (ownerId !== interaction.user.id || !interaction.guild || interaction.guild.ownerId !== interaction.user.id) return interaction.reply({ embeds: [embed('Owner only', 'Only the guild owner can use this setup.')], ephemeral: true });
+    const key = `${interaction.guild.id}:${ownerId}`;
+    const state = botSetups.get(key);
+    if (!state) return interaction.update({ embeds: [embed('Setup expired', 'Run `-botsetup` to start again.')], components: [] });
+    if (action === 'cancel') { botSetups.delete(key); return interaction.update({ embeds: [embed('Bot setup cancelled', 'No permission changes were made.')], components: [] }); }
+    if (action === 'start') state.step = 'level';
+    else if (action === 'level') { state.level = interaction.values[0]; state.step = 'targetType'; }
+    else if (action === 'targetType') state.step = 'target';
+    else if (action === 'target') { state.targetId = interaction.values[0]; state.step = state.level === 'admin' ? 'confirm' : 'commands'; }
+    else if (action === 'commands') { state.permissions[`${state.level}s`].commands = [...new Set(interaction.values)]; state.step = 'confirm'; }
+    else if (action === 'back') state.step = 'level';
+    else if (action === 'confirm') {
+      configureLevel({ permissions: state.permissions }, state.level, state.targetType, state.targetId);
+      setCommands({ permissions: state.permissions }, state.level, state.permissions[permissionStoreKey(state.level)].commands);
+      const data = guildData(interaction.guild); data.permissions = state.permissions; save(); botSetups.delete(key);
+      await log(interaction.guild, 'main', 'Bot setup updated', `Bot ${state.level} access was configured by <@${ownerId}>.`);
+      return interaction.update({ embeds: [embed('Bot setup complete', `${state.level} access is configured.\nTarget: <@${state.targetId}>\nCommands: ${state.level === 'admin' ? 'All commands' : state.permissions[`${state.level}s`].commands.join(', ') || 'None'}`)], components: [] });
+    }
+    if (action === 'targetType') state.targetType = interaction.values[0];
+    botSetups.set(key, state);
+    return interaction.update(botSetupView(ownerId, state));
+  }
   if ((interaction.isButton() || interaction.isStringSelectMenu() || interaction.isChannelSelectMenu()) && interaction.customId.startsWith('ps:')) {
     const [, ownerId, action, value] = interaction.customId.split(':');
     if (ownerId !== interaction.user.id) return interaction.reply({ embeds: [embed('Setup locked', 'Only the guild owner who opened this setup can use it.')], ephemeral: true });
@@ -557,8 +666,10 @@ client.on('interactionCreate', async interaction => {
     return interaction.update(setupView(ownerId, state));
   }
   if (interaction.isStringSelectMenu() && interaction.customId === 'menu:commands') {
+    if (interaction.values[0] === 'overview') return interaction.update(dashboard());
     const items = menus[interaction.values[0]]; return interaction.update({ embeds: [embed(`${interaction.values[0]} commands`, items.map(([name, usage]) => `**${usage}**`).join('\n'))], components: [interaction.message.components[0], interaction.message.components[1]] });
   }
+  if (interaction.isButton() && interaction.customId === 'commands:home') return interaction.update(dashboard());
   if (interaction.isButton() && interaction.customId.startsWith('commands:page:')) {
     const index = Number(interaction.customId.split(':')[2]); return interaction.update(dashboard(index));
   }
@@ -695,6 +806,22 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
   if (!member || member.user.bot) return;
 
   const guildId = member.guild.id;
+  const data = guildData(member.guild);
+  if (oldState.channelId !== newState.channelId) {
+    addHistory(data, member.id, { event: newState.channelId ? (oldState.channelId ? 'move' : 'join') : 'leave', channelId: newState.channelId || oldState.channelId, at: new Date().toISOString() });
+    for (const [followerId, targetId] of Object.entries(ensureVoice(data).follows)) {
+      if (targetId !== member.id) continue;
+      const follower = member.guild.members.cache.get(followerId);
+      if (follower?.voice && newState.channel && follower.voice.channelId !== newState.channelId && follower.manageable) await follower.voice.setChannel(newState.channel, 'VC follow').catch(() => {});
+    }
+    for (const chain of Object.values(ensureVoice(data).chains)) {
+      const index = chain.indexOf(member.id);
+      if (index < 0 || !newState.channel) continue;
+      const next = chain[index + 1] && member.guild.members.cache.get(chain[index + 1]);
+      if (next?.voice && next.voice.channelId !== newState.channelId && next.manageable) await next.voice.setChannel(newState.channel, 'VC chain').catch(() => {});
+    }
+    save();
+  }
   const stfuKey = `${guildId}:${member.id}`;
   if (stfuProcessing.has(stfuKey)) {
     stfuProcessing.delete(stfuKey);
