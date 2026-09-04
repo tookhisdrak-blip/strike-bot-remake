@@ -10,10 +10,10 @@
     "test": "node --test"
   },
   "engines": {
-    "node": ">=20"
+    "node": "20.x"
   },
   "dependencies": {
-    "better-sqlite3": "^13.0.3",
+    "better-sqlite3": "12.4.1",
     "discord.js": "^14.25.1",
     "dotenv": "^16.6.1"
   }
