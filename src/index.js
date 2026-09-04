@@ -27,7 +27,8 @@ let godmodeDb = fs.existsSync(godmodeFile) ? JSON.parse(fs.readFileSync(godmodeF
 const save = () => fs.writeFileSync(file, JSON.stringify(db, null, 2));
 const saveGodmode = () => fs.writeFileSync(godmodeFile, JSON.stringify(godmodeDb, null, 2));
 const guildData = guild => {
-  const data = db[guild.id] ||= { strikes: {}, removedStrikes: {}, logs: {}, staffRoleId: null, protectedUsers: {}, protectedRoles: {}, staffBlacklistUsers: {}, staffBlacklistRoles: {}, staffBlacklistHistory: [], botProfile: {}, aliases: {} };
+  const data = db[guild.id] ||= { strikes: {}, strikeHistory: [], removedStrikes: {}, logs: {}, staffRoleId: null, protectedUsers: {}, protectedRoles: {}, staffBlacklistUsers: {}, staffBlacklistRoles: {}, staffBlacklistHistory: [], botProfile: {}, aliases: {} };
+  data.strikeHistory ||= [];
   data.staffBlacklistUsers ||= {};
   data.staffBlacklistRoles ||= {};
   data.staffBlacklistHistory ||= [];
@@ -128,7 +129,7 @@ const page = (title, items, index, total, makeText, idPrefix = 'page') => {
 };
 
 const commandList = [
-  ['-commands / -cmds', 'Open the command dashboard'], ['-logs', 'Show configured log channels'], ['-setlogs <type> <channel>', 'Set strike, protected, or main logs'],
+  ['-help / -commands / -cmds', 'Open the command dashboard'], ['-logs', 'Show configured log channels'], ['-setlogs <type> <channel>', 'Set strike, protected, or main logs'],
   ['-strike @user <reason>', 'Add a strike; third strike removes permission roles'], ['-st @user <reason>', 'Alias for strike'], ['-rmstrike @user <reason>', 'Remove the latest strike'],
   ['-rmst @user <reason>', 'Alias for rmstrike'], ['-clearstrikes @user <reason>', 'Clear every current strike'], ['-strikelist', 'List current strikes, six people per page'],
   ['-protect @user|role|ID', 'Protect a user or role from role removal'], ['-rmprotection @user|role|ID', 'Remove protection'], ['-plist', 'List all protected users and protected roles'], ['-view @user|role|ID', 'Show protection, strikes, roles, and tenure'],
@@ -157,6 +158,7 @@ const dashboard = (index = 0) => {
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.GuildVoiceStates], partials: [Partials.GuildMember, Partials.User] });
 const cooldowns = new Map();
 const protectionAttempts = new Map();
+const protectionRestorations = new Set();
 const godmodeProcessing = new Map();
 client.once('ready', () => {
   client.user.setPresence({ status: 'online', activities: [{ name: '.gg/intweakin', type: 0 }] });
@@ -169,9 +171,18 @@ client.on('messageCreate', async message => {
   const command = args.shift()?.toLowerCase();
   if (!command) return;
   const data = guildData(message.guild);
-  if (command === 'commands' || command === 'cmds') return message.reply(dashboard());
-  if (command === 'logs') return reply(message, 'Configured logs', `Strike: ${mentionChannel(message.guild, data.logs.strike)}\nProtected: ${mentionChannel(message.guild, data.logs.protected)}\nMain: ${mentionChannel(message.guild, data.logs.main)}`);
-  if (command === 'viewaliases') return reply(message, 'Aliases', '`-cmds` = `-commands`\n`-st` = `-strike`\n`-rmst` = `-rmstrike`');
+  if (command === 'help' || command === 'commands' || command === 'cmds') {
+    if (!isStaff(message)) return reply(message, 'Access denied', 'You need the configured staff role to use this bot.');
+    return message.reply(dashboard());
+  }
+  if (command === 'logs') {
+    if (!isStaff(message)) return reply(message, 'Access denied', 'You need the configured staff role to use this bot.');
+    return reply(message, 'Configured logs', `Strike: ${mentionChannel(message.guild, data.logs.strike)}\nProtected: ${mentionChannel(message.guild, data.logs.protected)}\nMain: ${mentionChannel(message.guild, data.logs.main)}`);
+  }
+  if (command === 'viewaliases') {
+    if (!isStaff(message)) return reply(message, 'Access denied', 'You need the configured staff role to use this bot.');
+    return reply(message, 'Aliases', '`-cmds` = `-commands`\n`-st` = `-strike`\n`-rmst` = `-rmstrike`');
+  }
   if (command === 'vmc') {
     const voiceStats = getVoiceStats(message.guild);
     return message.reply({
@@ -263,8 +274,10 @@ client.on('messageCreate', async message => {
   if (command === 'setstaff') {
     const role = roleResolver(message.guild, args[0]);
     if (!role) return reply(message, 'Invalid role', 'Usage: `-setstaff @role|role ID`');
-    if (data.staffRoleId) return reply(message, 'Staff role already configured', `setstaff role already configured to "${message.guild.roles.cache.get(data.staffRoleId)?.name || data.staffRoleId}". To change this do the command \'-resetstaffrole\' to reconfigure the staff role to a new role.`);
-    data.staffRoleId = role.id; save(); return reply(message, 'Staff role set', `${role} can now access bot commands.`);
+    const previousRoleId = data.staffRoleId;
+    data.staffRoleId = role.id; save();
+    await log(message.guild, 'main', 'Staff role configured', `${role} is now the bot staff role${previousRoleId ? ` (replacing <@&${previousRoleId}>)` : ''}. Changed by ${message.author}.`);
+    return reply(message, 'Staff role set', `${role} can now access bot commands.`);
   }
   if (command === 'resetstaffrole') {
     if (!data.staffRoleId) return reply(message, 'No staff role configured', 'Use `-setstaff @role|role ID` to configure one.');
@@ -311,18 +324,39 @@ client.on('messageCreate', async message => {
   if (command === 'strike' || command === 'st' || command === 'rmstrike' || command === 'rmst' || command === 'clearstrikes') {
     const { target, reason } = await parseTargetReason(message);
     if (!target || !reason) return reply(message, 'Reason required', 'A reason is required. Usage: `-' + (command === 'rmst' ? 'rmstrike' : command === 'st' ? 'strike' : command) + ' @user <reason>`');
-    if (target.id === message.author.id) return reply(message, 'Strike blocked', 'You cannot strike yourself.');
     const staffRoleId = data.staffRoleId;
-    if (staffRoleId && target.id !== message.guild.ownerId && (message.guild.members.cache.get(target.id)?.roles.cache.has(staffRoleId))) return reply(message, 'Strike blocked', 'You cannot strike someone who has the configured staff role.');
+    if (command === 'strike' || command === 'st') {
+      if (target.id === message.author.id) return reply(message, 'Strike blocked', 'You cannot strike yourself.');
+      if (target.id === message.guild.ownerId) return reply(message, 'Strike blocked', 'You cannot strike the guild owner.');
+      if (target.id === client.user.id) return reply(message, 'Strike blocked', 'You cannot strike the bot.');
+      if (staffRoleId && target.id !== message.guild.ownerId && (message.guild.members.cache.get(target.id)?.roles.cache.has(staffRoleId))) return reply(message, 'Strike blocked', 'You cannot strike a member of the staff management team.');
+    }
     const records = data.strikes[target.id] ||= [];
-    if (command === 'clearstrikes') { records.length = 0; save(); await log(message.guild, 'strike', 'Strikes cleared', `${target} cleared by ${message.author}. Reason: ${reason}`); return reply(message, 'Strikes cleared', `All current strikes for ${target} were cleared.`); }
-    if (command === 'rmstrike') { if (!records.length) return reply(message, 'No strikes', `${target} has no current strikes.`); const removed = records.pop(); (data.removedStrikes[target.id] ||= []).push({ ...removed, removedAt: new Date().toISOString(), removedBy: message.author.id, removalReason: reason }); save(); await log(message.guild, 'strike', 'Strike removed', `${target} had a strike removed by ${message.author}. Reason: ${reason}`); return reply(message, 'Strike removed', `Removed strike from ${target}.`); }
-    const key = `${message.guild.id}:${target.id}`; const last = cooldowns.get(key) || 0;
+    if (command === 'clearstrikes') {
+      const clearedAt = new Date().toISOString();
+      const clearedCount = records.length;
+      for (const record of records) {
+        record.status = 'removed'; record.removedAt = clearedAt; record.removedBy = message.author.id; record.removalReason = reason; record.removalType = 'cleared';
+      }
+      data.strikes[target.id] = [];
+      save(); await log(message.guild, 'strike', 'Strikes cleared', `${target} had ${clearedCount} strike(s) cleared by ${message.author}. Reason: ${reason}`); return reply(message, 'Strikes cleared', `All current strikes for ${target} were cleared.`);
+    }
+    if (command === 'rmstrike') {
+      if (!records.length) return reply(message, 'No strikes', `${target} has no current strikes.`);
+      const removed = records.pop(); const removedAt = new Date().toISOString();
+      removed.status = 'removed'; removed.removedAt = removedAt; removed.removedBy = message.author.id; removed.removalReason = reason; removed.removalType = 'removed';
+      (data.removedStrikes[target.id] ||= []).push(removed);
+      save(); await log(message.guild, 'strike', 'Strike removed', `${target} had strike ${removed.id || 'record'} removed by ${message.author}. Reason: ${reason}`); return reply(message, 'Strike removed', `Removed strike ${removed.id || 'record'} from ${target}.`);
+    }
+    const key = `${message.guild.id}:${message.author.id}:${target.id}`; const last = cooldowns.get(key) || 0;
     if (Date.now() - last < 15000) return reply(message, 'Strike cooldown', 'Wait 15 seconds before striking this user again.');
-    cooldowns.set(key, Date.now()); records.push({ at: new Date().toISOString(), by: message.author.id, reason });
-    if (records.length >= 3) {
+    cooldowns.set(key, Date.now());
+    const strike = { id: `${message.guild.id}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, guildId: message.guild.id, targetId: target.id, at: new Date().toISOString(), by: message.author.id, reason, status: 'active' };
+    records.push(strike); data.strikeHistory.push(strike);
+    if (records.length === 3) {
       const member = await message.guild.members.fetch(target.id).catch(() => null);
-      const removedRoles = member?.roles.cache.filter(isAdminRole).map(role => role.id) || [];
+      const highestBotRole = member?.guild.members.me?.roles.highest;
+      const removedRoles = member?.roles.cache.filter(role => isAdminRole(role) && (!highestBotRole || role.position < highestBotRole.position)).map(role => role.id) || [];
       if (member && removedRoles.length) await member.roles.remove(removedRoles, 'Three strikes').catch(() => {});
       await target.send({ embeds: [embed('Staff removal', `You received your third strike in **${message.guild.name}** and were removed from staff permission roles.\nReason: ${reason}`)] }).catch(() => {});
       await log(message.guild, 'strike', 'Third strike: staff roles removed', `${target} reached 3 strikes. Removed ${removedRoles.length} permission role(s). By ${message.author}.`);
@@ -440,20 +474,33 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
   const executorId = auditEntry?.executor?.id;
 
   if (protectedUserEntry && missingProtected.size) {
-    if (!executorId || executorId !== protectedUserEntry.by) {
+    const restorationKey = `${newMember.guild.id}:${newMember.id}`;
+    if (protectionRestorations.has(restorationKey)) {
+      protectionRestorations.delete(restorationKey);
+      return;
+    }
+    if (!executorId || (executorId !== protectedUserEntry.by && executorId !== newMember.guild.ownerId)) {
       const key = `${newMember.guild.id}:${executorId || 'unknown'}:${newMember.id}`;
       const recent = (protectionAttempts.get(key) || []).filter(time => Date.now() - time < 30000);
       recent.push(Date.now());
       protectionAttempts.set(key, recent);
-      if (recent.length >= 3) {
+      if (recent.length >= 4) {
         const offender = executorId ? await newMember.guild.members.fetch(executorId).catch(() => null) : null;
         const permissionRoles = offender?.roles.cache.filter(role => isPermissionRole(role)).map(role => role.id) || [];
         if (permissionRoles.length) await offender.roles.remove(permissionRoles, 'Repeated protected-user tampering').catch(() => {});
         protectionAttempts.delete(key);
         await log(newMember.guild, 'protected', 'Protection escalation', `${offender || 'An unknown actor'} had permission roles removed after repeated tampering with a protected user.`);
       }
-      await newMember.roles.add([...missingProtected], 'Restore protected user roles').catch(() => {});
-      await log(newMember.guild, 'protected', 'Protected roles restored', `Restored protected roles for ${newMember} after an unauthorized role change.`);
+      const manageableMissing = [...missingProtected].filter(roleId => {
+        const role = newMember.guild.roles.cache.get(roleId);
+        return role && (!newMember.guild.members.me?.roles.highest || role.position < newMember.guild.members.me.roles.highest.position);
+      });
+      if (manageableMissing.length) {
+        protectionRestorations.add(restorationKey);
+        const restored = await newMember.roles.add(manageableMissing, 'Restore protected user roles').then(() => true).catch(() => false);
+        if (restored) await log(newMember.guild, 'protected', 'Protected roles restored', `Restored protected roles for ${newMember} after an unauthorized role change.`);
+        else protectionRestorations.delete(restorationKey);
+      }
       return;
     }
   }
@@ -461,10 +508,16 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
   const protectedRoleMissing = [...oldMember.roles.cache.keys()].filter(roleId => !newMember.roles.cache.has(roleId) && data.protectedRoles[roleId]);
   for (const roleId of protectedRoleMissing) {
     const protectorId = data.protectedRoles[roleId]?.by;
-    const isAllowedRemoval = !executorId || executorId === protectorId;
+    const isAllowedRemoval = !executorId || executorId === protectorId || executorId === newMember.guild.ownerId;
     if (!isAllowedRemoval || !protectedRoleMissing.length) {
-      await newMember.roles.add(roleId, 'Protected role re-added').catch(() => {});
-      await log(newMember.guild, 'protected', 'Protected role restored', `Re-added protected role <@&${roleId}> to ${newMember} because it was removed without the original protector.`);
+      const role = newMember.guild.roles.cache.get(roleId);
+      if (role && (!newMember.guild.members.me?.roles.highest || role.position < newMember.guild.members.me.roles.highest.position)) {
+        const restorationKey = `${newMember.guild.id}:${newMember.id}`;
+        protectionRestorations.add(restorationKey);
+        const restored = await newMember.roles.add(roleId, 'Protected role re-added').then(() => true).catch(() => false);
+        if (restored) await log(newMember.guild, 'protected', 'Protected role restored', `Re-added protected role <@&${roleId}> to ${newMember} because it was removed without the original protector.`);
+        else protectionRestorations.delete(restorationKey);
+      }
       return;
     }
   }
@@ -477,7 +530,7 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
     const recent = (protectionAttempts.get(key) || []).filter(time => Date.now() - time < 30000);
     recent.push(Date.now());
     protectionAttempts.set(key, recent);
-    if (recent.length >= 3) {
+    if (recent.length >= 4) {
       const offender = await newMember.guild.members.fetch(executorId).catch(() => null);
       const permissionRoles = offender?.roles.cache.filter(role => isPermissionRole(role)).map(role => role.id) || [];
       if (permissionRoles.length) await offender.roles.remove(permissionRoles, 'Repeated protected-role tampering').catch(() => {});

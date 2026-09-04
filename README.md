@@ -11,13 +11,13 @@ A prefix-based Discord staff strike and role-protection bot built with `discord.
 5. Copy `.env.example` to `.env` and set `DISCORD_TOKEN`.
 6. Run `npm start`.
 
-The guild owner must first run `-setstaff @role`. Only the guild owner can change that role: run `-resetstaffrole` before configuring a replacement. Then configure logs with `-setlogs strike`, `-setlogs protected`, and `-setlogs main`.
+The guild owner must first run `-setstaff @role`. Only the guild owner can change that role; running `-setstaff` again replaces the previous role. Then configure logs with `-setlogs strike`, `-setlogs protected`, and `-setlogs main`.
 
-All runtime data is stored in `data/guilds.json`, which is ignored by Git. Every bot response and log is sent as a compact colorless embed. Commands use the `-` prefix by default.
+All runtime data is stored in `data/guilds.json` and `data/godmode.json`, which are ignored by Git. On Railway, attach a persistent volume mounted to the project's `data` directory; otherwise an instance replacement can discard local JSON files. Every bot response and log is sent as a compact colorless embed. Commands use the `-` prefix by default.
 
 ## Commands
 
-Run `-commands` or `-cmds` for the interactive command dashboard. It contains moderation, protection, and owner-only command groups.
+Run `-help`, `-commands`, or `-cmds` for the interactive command dashboard. It contains moderation, protection, and owner-only command groups.
 
 The dashboard shows six commands per page. Use the dropdown to switch groups and the Previous/Next buttons to browse without rerunning the command. Staff can use `-botclear` to remove up to 20 recent messages from themselves and this bot in the current channel; the bot needs `Manage Messages`.
 
