@@ -1,5 +1,4 @@
 require('dotenv').config();
-const fs = require('node:fs');
 const path = require('node:path');
 const {
   Client, GatewayIntentBits, Partials, EmbedBuilder, ActionRowBuilder,
@@ -18,16 +17,17 @@ const { isPermissionRole, collectProtectedRoleIds, getProtectedRoleTargetsForMem
 const { ensurePermissions, getLevel, canUseCommand, getEffectivePermissions, getHierarchy, configureLevel, setCommands, configurePaid, removePaid } = require('./permissions');
 const { ensureVoice, addHistory, setFollow, removeFollow, setChain } = require('./voice');
 const { getVoiceStats, getMemberStats } = require('./stats');
+const { createDatabase } = require('./database');
 
 const PREFIX = process.env.PREFIX || '-';
 const dataDir = path.join(__dirname, '..', 'data');
-fs.mkdirSync(dataDir, { recursive: true });
 const file = path.join(dataDir, 'guilds.json');
 const godmodeFile = path.join(dataDir, 'godmode.json');
-let db = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : {};
-let godmodeDb = fs.existsSync(godmodeFile) ? JSON.parse(fs.readFileSync(godmodeFile, 'utf8')) : {};
-const save = () => fs.writeFileSync(file, JSON.stringify(db, null, 2));
-const saveGodmode = () => fs.writeFileSync(godmodeFile, JSON.stringify(godmodeDb, null, 2));
+const storage = createDatabase(dataDir);
+let db = storage.load('guilds', file);
+let godmodeDb = storage.load('godmode', godmodeFile);
+const save = () => storage.save('guilds', db);
+const saveGodmode = () => storage.save('godmode', godmodeDb);
 const guildData = guild => {
   const data = db[guild.id] ||= { guildId: guild.id, strikes: {}, strikeHistory: [], removedStrikes: {}, logs: {}, staffRoleId: null, protectedUsers: {}, protectedRoles: {}, protection: {}, stfu: {}, stfuHistory: [], voice: {}, permissions: {}, staffBlacklistUsers: {}, staffBlacklistRoles: {}, staffBlacklistHistory: [], botProfile: {}, aliases: {} };
   data.guildId ||= guild.id;

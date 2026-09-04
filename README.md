@@ -13,7 +13,7 @@ A prefix-based Discord staff strike and role-protection bot built with `discord.
 
 The guild owner must first run `-setstaff @role`. Only the guild owner can change that role; running `-setstaff` again replaces the previous role. Then configure logs with `-setlogs strike`, `-setlogs protected`, and `-setlogs main`.
 
-All runtime data is stored in `data/guilds.json` and `data/godmode.json`, which are ignored by Git. On Railway, attach a persistent volume mounted to the project's `data` directory; otherwise an instance replacement can discard local JSON files. Every bot response and log is sent as a compact colorless embed. Commands use the `-` prefix by default.
+All runtime data is stored in the SQLite database `data/bot.db`, which is ignored by Git. Existing `data/guilds.json` and `data/godmode.json` files are imported automatically on first database startup and left untouched as migration backups. On Railway, attach a persistent volume mounted to the project's `data` directory; otherwise an instance replacement can discard the database. Every bot response and log is sent as a compact colorless embed. Commands use the `-` prefix by default.
 
 ## Commands
 
