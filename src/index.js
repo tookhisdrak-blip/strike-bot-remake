@@ -3,7 +3,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const {
   Client, GatewayIntentBits, Partials, EmbedBuilder, ActionRowBuilder,
-  ButtonBuilder, ButtonStyle, StringSelectMenuBuilder, PermissionFlagsBits,
+  ButtonBuilder, ButtonStyle, StringSelectMenuBuilder, ChannelSelectMenuBuilder, PermissionFlagsBits,
   AuditLogEvent, ChannelType, Role
 } = require('discord.js');
 const {
@@ -27,8 +27,11 @@ let godmodeDb = fs.existsSync(godmodeFile) ? JSON.parse(fs.readFileSync(godmodeF
 const save = () => fs.writeFileSync(file, JSON.stringify(db, null, 2));
 const saveGodmode = () => fs.writeFileSync(godmodeFile, JSON.stringify(godmodeDb, null, 2));
 const guildData = guild => {
-  const data = db[guild.id] ||= { strikes: {}, strikeHistory: [], removedStrikes: {}, logs: {}, staffRoleId: null, protectedUsers: {}, protectedRoles: {}, staffBlacklistUsers: {}, staffBlacklistRoles: {}, staffBlacklistHistory: [], botProfile: {}, aliases: {} };
+  const data = db[guild.id] ||= { strikes: {}, strikeHistory: [], removedStrikes: {}, logs: {}, staffRoleId: null, protectedUsers: {}, protectedRoles: {}, protection: {}, stfu: {}, stfuHistory: [], staffBlacklistUsers: {}, staffBlacklistRoles: {}, staffBlacklistHistory: [], botProfile: {}, aliases: {} };
   data.strikeHistory ||= [];
+  data.protection ||= {};
+  data.stfu ||= {};
+  data.stfuHistory ||= [];
   data.staffBlacklistUsers ||= {};
   data.staffBlacklistRoles ||= {};
   data.staffBlacklistHistory ||= [];
@@ -40,6 +43,8 @@ const reply = (message, title, description, extra = {}) => message.reply({ embed
 const mentionChannel = (guild, id) => id ? guild.channels.cache.get(id)?.toString() || `<#${id}>` : 'not configured';
 const isOwner = message => message.guild.ownerId === message.author.id;
 const isStaff = message => isOwner(message) || Boolean(guildData(message.guild).staffRoleId && message.member.roles.cache.has(guildData(message.guild).staffRoleId));
+const protectionConfig = data => ({ enabled: true, protectionType: 'both', automaticRestore: true, attemptThreshold: 4, attemptWindow: 30, punishment: 'strip', logChannel: data.logs.protected || null, configured: false, ...data.protection });
+const protectionTypeAllows = (config, isRole) => !config.configured || config.protectionType === 'both' || (isRole ? config.protectionType === 'roles' : config.protectionType === 'users');
 const isAdminRole = role => role && !role.managed && role.permissions.any(PermissionFlagsBits.Administrator | PermissionFlagsBits.ManageGuild | PermissionFlagsBits.ManageRoles | PermissionFlagsBits.BanMembers | PermissionFlagsBits.KickMembers);
 const isStaffBlacklistRole = role => role && !role.managed && role.permissions.any(PermissionFlagsBits.Administrator | PermissionFlagsBits.BanMembers | PermissionFlagsBits.KickMembers | PermissionFlagsBits.ModerateMembers | PermissionFlagsBits.MoveMembers);
 const roleResolver = (guild, input) => guild.roles.cache.get(input?.replace(/[<@&>]/g, '')) || guild.roles.cache.find(role => role.name.toLowerCase() === input?.toLowerCase());
@@ -112,11 +117,30 @@ const registerProtectionAttempt = (guildId, offenderId, targetId) => {
 };
 const log = async (guild, kind, title, text) => {
   const data = guildData(guild);
-  const channels = [data.logs[kind], data.logs.main].filter(Boolean);
+  const configuredChannel = kind === 'protected' ? data.protection?.logChannel || data.logs[kind] : data.logs[kind];
+  const channels = [configuredChannel, data.logs.main].filter(Boolean);
   for (const id of [...new Set(channels)]) {
     const channel = guild.channels.cache.get(id);
     if (channel?.isTextBased()) await channel.send({ embeds: [embed(title, text)] }).catch(() => {});
   }
+};
+const punishProtectionAttacker = async (guild, offender, config, reason) => {
+  if (!offender) return 'unknown executor';
+  if (config.punishment === 'ban' && guild.members.me?.permissions.has(PermissionFlagsBits.BanMembers) && offender.bannable) {
+    await offender.ban({ reason }).then(() => {}).catch(() => {});
+    return 'banned';
+  }
+  if (config.punishment === 'kick' && guild.members.me?.permissions.has(PermissionFlagsBits.KickMembers) && offender.kickable) {
+    await offender.kick(reason).then(() => {}).catch(() => {});
+    return 'kicked';
+  }
+  const botRole = guild.members.me?.roles.highest;
+  const roles = offender.roles.cache.filter(role => isPermissionRole(role) && (!botRole || role.position < botRole.position)).map(role => role.id);
+  if (roles.length) {
+    await offender.roles.remove(roles, reason).then(() => {}).catch(() => {});
+    return 'permissions stripped';
+  }
+  return 'action unavailable';
 };
 const page = (title, items, index, total, makeText, idPrefix = 'page') => {
   const start = index * 6;
@@ -128,16 +152,66 @@ const page = (title, items, index, total, makeText, idPrefix = 'page') => {
   return { embeds: [embed(title, `${body}\n\nPage ${index + 1}/${Math.max(total, 1)}`)], components: [row] };
 };
 
+const setupView = (ownerId, state, existing = false) => {
+  const config = state.config;
+  const summary = `Status: **${config.enabled ? 'Enabled' : 'Disabled'}**\nProtection: **${config.protectionType}**\nRestoration: **${config.automaticRestore ? 'Automatic' : 'Log only'}**\nAttack threshold: **${config.attemptThreshold} / ${config.attemptWindow}s**\nPunishment: **${config.punishment}**\nLog channel: **${config.logChannel ? `<#${config.logChannel}>` : 'Not configured'}**`;
+  if (existing && state.step === 'existing') {
+    return { embeds: [embed('Protection setup', `Protection is already configured.\n\n${summary}`)], components: [new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`ps:${ownerId}:reconfigure`).setLabel('Reconfigure').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId(`ps:${ownerId}:view`).setLabel('View Configuration').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`ps:${ownerId}:cancel`).setLabel('Cancel').setStyle(ButtonStyle.Secondary)
+    )] };
+  }
+  const descriptions = {
+    enable: 'Enable protection for this server?',
+    type: 'What would you like to protect?',
+    restore: 'What should happen when a protected role is removed?',
+    threshold: 'Choose the unauthorized-attempt threshold and time window.',
+    punishment: 'What should happen after repeated attacks?',
+    channel: 'Where should protection events be logged?',
+    confirm: `Review your configuration.\n\n${summary}`,
+  };
+  const rows = [];
+  if (state.step === 'enable') rows.push(new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`ps:${ownerId}:enable:yes`).setLabel('Enable Protection').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`ps:${ownerId}:enable:no`).setLabel('Disable Protection').setStyle(ButtonStyle.Secondary)
+  ));
+  if (state.step === 'type') rows.push(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId(`ps:${ownerId}:type`).setPlaceholder('Select protection type').addOptions(
+    { label: 'Users', value: 'users' }, { label: 'Roles', value: 'roles' }, { label: 'Both', value: 'both' }
+  )));
+  if (state.step === 'restore') rows.push(new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`ps:${ownerId}:restore:yes`).setLabel('Automatically Restore').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`ps:${ownerId}:restore:no`).setLabel('Log Only').setStyle(ButtonStyle.Secondary)
+  ));
+  if (state.step === 'threshold') rows.push(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId(`ps:${ownerId}:threshold`).setPlaceholder('Select attack threshold').addOptions(
+    { label: '4 attempts / 30 seconds', value: '4:30', description: 'Recommended default' },
+    { label: '5 attempts / 30 seconds', value: '5:30' }, { label: '6 attempts / 60 seconds', value: '6:60' }
+  )));
+  if (state.step === 'punishment') rows.push(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId(`ps:${ownerId}:punishment`).setPlaceholder('Select punishment').addOptions(
+    { label: 'Strip permissions', value: 'strip' }, { label: 'Kick', value: 'kick' }, { label: 'Ban', value: 'ban' }
+  )));
+  if (state.step === 'channel') rows.push(new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder().setCustomId(`ps:${ownerId}:channel`).setPlaceholder('Select protection log channel').setChannelTypes(ChannelType.GuildText)));
+  if (state.step === 'confirm') rows.push(new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`ps:${ownerId}:confirm`).setLabel('Confirm Setup').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`ps:${ownerId}:back`).setLabel('Back').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`ps:${ownerId}:cancel`).setLabel('Cancel').setStyle(ButtonStyle.Danger)
+  ));
+  if (state.step !== 'confirm') rows.push(new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`ps:${ownerId}:cancel`).setLabel('Cancel').setStyle(ButtonStyle.Danger)));
+  return { embeds: [embed('Protection setup', descriptions[state.step])], components: rows };
+};
+
 const commandList = [
   ['-help / -commands / -cmds', 'Open the command dashboard'], ['-logs', 'Show configured log channels'], ['-setlogs <type> <channel>', 'Set strike, protected, or main logs'],
   ['-strike @user <reason>', 'Add a strike; third strike removes permission roles'], ['-st @user <reason>', 'Alias for strike'], ['-rmstrike @user <reason>', 'Remove the latest strike'],
   ['-rmst @user <reason>', 'Alias for rmstrike'], ['-clearstrikes @user <reason>', 'Clear every current strike'], ['-strikelist', 'List current strikes, six people per page'],
   ['-protect @user|role|ID', 'Protect a user or role from role removal'], ['-rmprotection @user|role|ID', 'Remove protection'], ['-plist', 'List all protected users and protected roles'], ['-view @user|role|ID', 'Show protection, strikes, roles, and tenure'],
-  ['-godmode enable|disable|@user|@role', 'Enable Godmode for yourself or grant it with the staff role'], ['-setstaff @role|ID', 'Set the required staff role (owner only)'], ['-resetstaffrole', 'Clear the staff role so it can be reconfigured (owner only)'], ['-staffblacklist @user|role|ID <reason>', 'Blacklist staff permissions with a required reason'], ['-rmstaffblacklist @user|role|ID <reason>', 'Remove a staff blacklist with a required reason'], ['-staffblacklistlist', 'List active and removed blacklist history'], ['-avatar <image URL>', 'Change the bot avatar (owner only)'], ['-banner <image URL>', 'Change the bot banner (owner only)'], ['-bio <text>', 'Save bot bio text (owner only; Discord API limitation)'], ['-viewaliases', 'Show every command alias'], ['-botclear', 'Clear the last 20 user/bot response messages']
+  ['-setupprotection', 'Configure protection (owner only)'], ['-godmode enable|disable|@user|@role', 'Protect against mute, deafen, and role changes'], ['-stfu @user [reason]', 'Persistently server-mute a user'], ['-unstfu @user', 'Remove persistent server mute'],
+  ['-setstaff @role|ID', 'Set the required staff role (owner only)'], ['-resetstaffrole', 'Clear the staff role so it can be reconfigured (owner only)'], ['-staffblacklist @user|role|ID <reason>', 'Blacklist staff permissions with a required reason'], ['-rmstaffblacklist @user|role|ID <reason>', 'Remove a staff blacklist with a required reason'], ['-staffblacklistlist', 'List active and removed blacklist history'], ['-avatar <image URL>', 'Change the bot avatar (owner only)'], ['-banner <image URL>', 'Change the bot banner (owner only)'], ['-bio <text>', 'Save bot bio text (owner only; Discord API limitation)'], ['-viewaliases', 'Show every command alias'], ['-botclear', 'Clear the last 20 user/bot response messages']
 ];
 const menus = {
   moderation: [['strike', '-strike @user <reason>'], ['rmstrike', '-rmstrike @user <reason>'], ['strikelist', '-strikelist'], ['clearstrikes', '-clearstrikes @user <reason>'], ['staffblacklist', '-staffblacklist @user|role|ID <reason>'], ['rmstaffblacklist', '-rmstaffblacklist @user|role|ID <reason>'], ['staffblacklistlist', '-staffblacklistlist'], ['view', '-view @user|role|ID']],
-  protection: [['protect', '-protect @user|role|ID'], ['rmprotection', '-rmprotection @user|role|ID'], ['plist', '-plist'], ['godmode', '-godmode enable|disable|@user|@role']],
+  protection: [['setupprotection', '-setupprotection'], ['protect', '-protect @user|role|ID'], ['rmprotection', '-rmprotection @user|role|ID'], ['plist', '-plist'], ['godmode', '-godmode enable|disable|@user|@role']],
+  voice: [['stfu', '-stfu @user [reason]'], ['unstfu', '-unstfu @user']],
   owner: [['setstaff', '-setstaff @role|ID'], ['resetstaffrole', '-resetstaffrole'], ['setlogs protected', '-setlogs protected #channel|ID'], ['setlogs strike', '-setlogs strike #channel|ID'], ['setlogs main', '-setlogs main #channel|ID'], ['avatar', '-avatar <image URL>'], ['banner', '-banner <image URL>'], ['bio', '-bio <text>']]
 };
 const dashboard = (index = 0) => {
@@ -146,6 +220,7 @@ const dashboard = (index = 0) => {
   const select = new StringSelectMenuBuilder().setCustomId('menu:commands').setPlaceholder('Choose a command group').addOptions(
     { label: 'Moderation', value: 'moderation', description: 'Strike and review staff' },
     { label: 'Protection', value: 'protection', description: 'Protect users and roles' },
+    { label: 'Voice moderation', value: 'voice', description: 'Persistent server mute controls' },
     { label: 'Server owner', value: 'owner', description: 'Server-only configuration' }
   );
   const navigation = new ActionRowBuilder().addComponents(
@@ -159,10 +234,29 @@ const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBit
 const cooldowns = new Map();
 const protectionAttempts = new Map();
 const protectionRestorations = new Set();
+const protectionSetups = new Map();
 const godmodeProcessing = new Map();
+const stfuProcessing = new Set();
+const enforceStfu = async member => {
+  const record = guildData(member.guild).stfu[member.id];
+  if (!record?.active || !member.voice?.channel || member.voice.serverMute) return false;
+  const key = `${member.guild.id}:${member.id}`;
+  stfuProcessing.add(key);
+  const muted = await member.voice.setMute(true, `Active STFU: ${record.reason}`).then(() => true).catch(() => false);
+  if (!muted) stfuProcessing.delete(key);
+  if (muted) await log(member.guild, 'protected', 'STFU enforced', `${member} was re-muted because STFU is active.`);
+  return muted;
+};
 client.once('ready', () => {
   client.user.setPresence({ status: 'online', activities: [{ name: '.gg/intweakin', type: 0 }] });
   console.log(`Ready as ${client.user.tag}`);
+  for (const guild of client.guilds.cache.values()) {
+    for (const record of Object.values(guildData(guild).stfu)) {
+      if (!record.active) continue;
+      const member = guild.members.cache.get(record.targetId);
+      if (member?.voice?.channel && !member.voice.serverMute) enforceStfu(member).catch(() => {});
+    }
+  }
 });
 
 client.on('messageCreate', async message => {
@@ -182,6 +276,13 @@ client.on('messageCreate', async message => {
   if (command === 'viewaliases') {
     if (!isStaff(message)) return reply(message, 'Access denied', 'You need the configured staff role to use this bot.');
     return reply(message, 'Aliases', '`-cmds` = `-commands`\n`-st` = `-strike`\n`-rmst` = `-rmstrike`');
+  }
+  if (command === 'setupprotection') {
+    if (!isOwner(message)) return reply(message, 'Owner only', 'Only the guild owner can configure protection.');
+    const config = protectionConfig(data);
+    const state = { step: config.configured ? 'existing' : 'enable', config: { ...config } };
+    protectionSetups.set(`${message.guild.id}:${message.author.id}`, state);
+    return message.reply(setupView(message.author.id, state, config.configured));
   }
   if (command === 'vmc') {
     const voiceStats = getVoiceStats(message.guild);
@@ -231,7 +332,7 @@ client.on('messageCreate', async message => {
     data.botProfile[command] = url.toString(); save();
     return reply(message, `${command} updated`, `The bot ${command} was updated successfully.`);
   }
-  if (!['commands', 'cmds', 'logs', 'viewaliases', 'setlogs', 'setstaff', 'resetstaffrole', ...profileCommands].includes(command) && !isStaff(message)) return reply(message, 'Access denied', 'You need the configured staff role to use this bot.');
+  if (!['help', 'commands', 'cmds', 'logs', 'viewaliases', 'setupprotection', 'setlogs', 'setstaff', 'resetstaffrole', ...profileCommands].includes(command) && !isStaff(message)) return reply(message, 'Access denied', 'You need the configured staff role to use this bot.');
   if (command === 'botclear') {
     if (!message.channel.permissionsFor(message.guild.members.me).has(PermissionFlagsBits.ManageMessages)) return reply(message, 'Cleanup unavailable', 'The bot needs Manage Messages in this channel.');
     const messages = await message.channel.messages.fetch({ limit: 100 });
@@ -270,6 +371,27 @@ client.on('messageCreate', async message => {
     setGodmodeForUser(godmodeDb, message.guild.id, target.id, { grantedBy: message.author.id, source: 'staff', roleIds: [] });
     saveGodmode();
     return reply(message, 'Godmode granted to @user', `Godmode granted to ${target}.`);
+  }
+  if (command === 'stfu' || command === 'unstfu') {
+    const target = message.mentions.members.first() || await message.guild.members.fetch(args[0]?.replace(/[<@!>]/g, '')).catch(() => null);
+    if (!target || target.user.bot) return reply(message, 'Invalid target', 'Usage: `-stfu @user [reason]`');
+    if (target.id === message.author.id || target.id === message.guild.ownerId) return reply(message, 'Action blocked', 'You cannot apply this action to yourself or the guild owner.');
+    if (command === 'unstfu') {
+      const record = data.stfu[target.id];
+      if (!record?.active) return reply(message, 'STFU not active', `${target} is not currently under STFU.`);
+      record.active = false; record.removedBy = message.author.id; record.removedAt = new Date().toISOString();
+      data.stfuHistory.push({ ...record }); delete data.stfu[target.id]; save();
+      if (target.voice?.channel) await target.voice.setMute(false, 'STFU removed').catch(() => {});
+      await log(message.guild, 'protected', 'STFU removed', `${target} was released by ${message.author}.`);
+      return reply(message, 'STFU removed', `${target} is no longer under persistent server mute.`);
+    }
+    if (!message.guild.members.me?.permissions.has(PermissionFlagsBits.MuteMembers) || !target.manageable) return reply(message, 'Action unavailable', 'I cannot manage that member because of missing Mute Members permission or role hierarchy.');
+    const reason = args.slice(1).join(' ').trim() || 'No reason provided';
+    const record = { guildId: message.guild.id, targetId: target.id, executorId: message.author.id, reason, timestamp: new Date().toISOString(), active: true };
+    data.stfu[target.id] = record; save();
+    if (target.voice?.channel) await target.voice.setMute(true, `STFU: ${reason}`).catch(() => {});
+    await log(message.guild, 'protected', 'STFU applied', `${target} was server-muted by ${message.author}. Reason: ${reason}`);
+    return reply(message, 'STFU applied', `${target} will remain server-muted until ` + '```-unstfu @user```' + ' is used.');
   }
   if (command === 'setstaff') {
     const role = roleResolver(message.guild, args[0]);
@@ -378,6 +500,9 @@ client.on('messageCreate', async message => {
     if (!target) return reply(message, 'Invalid target', `Usage: ${PREFIX}${command} @user|role|ID`);
     const id = target.id; const isRole = target instanceof Role || target.constructor?.name === 'Role';
     if (command === 'protect') {
+      const config = protectionConfig(data);
+      if (!config.enabled) return reply(message, 'Protection disabled', 'Protection is disabled. Run `-setupprotection` to enable it.');
+      if (!protectionTypeAllows(config, isRole)) return reply(message, 'Protection type blocked', `This server is configured to protect ${config.protectionType}.`);
       const member = !isRole ? await message.guild.members.fetch(id).catch(() => null) : null;
       const snapshot = isRole ? [] : (member?.roles.cache.filter(role => role.id !== message.guild.id).map(role => role.id) || []);
       const record = { by: message.author.id, roles: snapshot, at: new Date().toISOString() };
@@ -405,6 +530,32 @@ client.on('messageCreate', async message => {
 });
 
 client.on('interactionCreate', async interaction => {
+  if ((interaction.isButton() || interaction.isStringSelectMenu() || interaction.isChannelSelectMenu()) && interaction.customId.startsWith('ps:')) {
+    const [, ownerId, action, value] = interaction.customId.split(':');
+    if (ownerId !== interaction.user.id) return interaction.reply({ embeds: [embed('Setup locked', 'Only the guild owner who opened this setup can use it.')], ephemeral: true });
+    if (!interaction.guild || interaction.guild.ownerId !== interaction.user.id) return interaction.reply({ embeds: [embed('Owner only', 'Only the current guild owner can configure protection.')], ephemeral: true });
+    const data = guildData(interaction.guild);
+    let state = protectionSetups.get(`${interaction.guild.id}:${ownerId}`);
+    if (action === 'cancel') { protectionSetups.delete(`${interaction.guild.id}:${ownerId}`); return interaction.update({ embeds: [embed('Protection setup cancelled', 'No protection settings were changed.')], components: [] }); }
+    if (action === 'view') return interaction.update(setupView(ownerId, { step: 'existing', config: protectionConfig(data) }, true));
+    if (action === 'reconfigure') state = { step: 'enable', config: protectionConfig(data) };
+    else if (!state) return interaction.update({ embeds: [embed('Setup expired', 'Run `-setupprotection` to start again.')], components: [] });
+    else if (action === 'enable') { state.config.enabled = value === 'yes'; state.step = 'type'; }
+    else if (action === 'type') { state.config.protectionType = interaction.values[0]; state.step = 'restore'; }
+    else if (action === 'restore') { state.config.automaticRestore = value === 'yes'; state.step = 'threshold'; }
+    else if (action === 'threshold') { const [threshold, window] = interaction.values[0].split(':').map(Number); state.config.attemptThreshold = threshold; state.config.attemptWindow = window; state.step = 'punishment'; }
+    else if (action === 'punishment') { state.config.punishment = interaction.values[0]; state.step = 'channel'; }
+    else if (action === 'channel') { state.config.logChannel = interaction.values[0]; state.step = 'confirm'; }
+    else if (action === 'back') { const previous = { confirm: 'channel', channel: 'punishment', punishment: 'threshold', threshold: 'restore', restore: 'type', type: 'enable' }; state.step = previous[state.step] || 'enable'; }
+    else if (action === 'confirm') {
+      data.protection = { ...protectionConfig(data), ...state.config, configured: true, configuredBy: ownerId, configuredAt: new Date().toISOString() };
+      save(); protectionSetups.delete(`${interaction.guild.id}:${ownerId}`);
+      await log(interaction.guild, 'protected', 'Protection configured', `Protection was configured by <@${ownerId}>.`);
+      return interaction.update({ embeds: [embed('Protection configured', 'Protection system successfully configured.\nUse `-protect` to protect a user or role.')], components: [] });
+    }
+    protectionSetups.set(`${interaction.guild.id}:${ownerId}`, state);
+    return interaction.update(setupView(ownerId, state));
+  }
   if (interaction.isStringSelectMenu() && interaction.customId === 'menu:commands') {
     const items = menus[interaction.values[0]]; return interaction.update({ embeds: [embed(`${interaction.values[0]} commands`, items.map(([name, usage]) => `**${usage}**`).join('\n'))], components: [interaction.message.components[0], interaction.message.components[1]] });
   }
@@ -446,6 +597,7 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
   }
 
   const data = guildData(newMember.guild);
+  const config = protectionConfig(data);
 
   const blacklistedRole = newMember.roles.cache.find(role => data.staffBlacklistRoles[role.id]);
   const blacklistEntry = data.staffBlacklistUsers[newMember.id] || (blacklistedRole && data.staffBlacklistRoles[blacklistedRole.id]);
@@ -473,7 +625,7 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
   const auditEntry = audit?.entries.find(entry => entry.target?.id === newMember.id && Date.now() - entry.createdTimestamp < 10000 && entry.executor?.id !== client.user.id);
   const executorId = auditEntry?.executor?.id;
 
-  if (protectedUserEntry && missingProtected.size) {
+  if (config.enabled && protectedUserEntry && missingProtected.size) {
     const restorationKey = `${newMember.guild.id}:${newMember.id}`;
     if (protectionRestorations.has(restorationKey)) {
       protectionRestorations.delete(restorationKey);
@@ -484,18 +636,17 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
       const recent = (protectionAttempts.get(key) || []).filter(time => Date.now() - time < 30000);
       recent.push(Date.now());
       protectionAttempts.set(key, recent);
-      if (recent.length >= 4) {
+      if (recent.length >= config.attemptThreshold) {
         const offender = executorId ? await newMember.guild.members.fetch(executorId).catch(() => null) : null;
-        const permissionRoles = offender?.roles.cache.filter(role => isPermissionRole(role)).map(role => role.id) || [];
-        if (permissionRoles.length) await offender.roles.remove(permissionRoles, 'Repeated protected-user tampering').catch(() => {});
+        const action = await punishProtectionAttacker(newMember.guild, offender, config, 'Repeated protected-user tampering');
         protectionAttempts.delete(key);
-        await log(newMember.guild, 'protected', 'Protection escalation', `${offender || 'An unknown actor'} had permission roles removed after repeated tampering with a protected user.`);
+        await log(newMember.guild, 'protected', 'Protection escalation', `${offender || 'An unknown actor'} triggered protection escalation; action: ${action}.`);
       }
       const manageableMissing = [...missingProtected].filter(roleId => {
         const role = newMember.guild.roles.cache.get(roleId);
         return role && (!newMember.guild.members.me?.roles.highest || role.position < newMember.guild.members.me.roles.highest.position);
       });
-      if (manageableMissing.length) {
+      if (config.automaticRestore && manageableMissing.length) {
         protectionRestorations.add(restorationKey);
         const restored = await newMember.roles.add(manageableMissing, 'Restore protected user roles').then(() => true).catch(() => false);
         if (restored) await log(newMember.guild, 'protected', 'Protected roles restored', `Restored protected roles for ${newMember} after an unauthorized role change.`);
@@ -509,9 +660,9 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
   for (const roleId of protectedRoleMissing) {
     const protectorId = data.protectedRoles[roleId]?.by;
     const isAllowedRemoval = !executorId || executorId === protectorId || executorId === newMember.guild.ownerId;
-    if (!isAllowedRemoval || !protectedRoleMissing.length) {
+    if (config.enabled && (!isAllowedRemoval || !protectedRoleMissing.length)) {
       const role = newMember.guild.roles.cache.get(roleId);
-      if (role && (!newMember.guild.members.me?.roles.highest || role.position < newMember.guild.members.me.roles.highest.position)) {
+      if (config.automaticRestore && role && (!newMember.guild.members.me?.roles.highest || role.position < newMember.guild.members.me.roles.highest.position)) {
         const restorationKey = `${newMember.guild.id}:${newMember.id}`;
         protectionRestorations.add(restorationKey);
         const restored = await newMember.roles.add(roleId, 'Protected role re-added').then(() => true).catch(() => false);
@@ -530,12 +681,11 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
     const recent = (protectionAttempts.get(key) || []).filter(time => Date.now() - time < 30000);
     recent.push(Date.now());
     protectionAttempts.set(key, recent);
-    if (recent.length >= 4) {
+    if (recent.length >= config.attemptThreshold) {
       const offender = await newMember.guild.members.fetch(executorId).catch(() => null);
-      const permissionRoles = offender?.roles.cache.filter(role => isPermissionRole(role)).map(role => role.id) || [];
-      if (permissionRoles.length) await offender.roles.remove(permissionRoles, 'Repeated protected-role tampering').catch(() => {});
+      const action = await punishProtectionAttacker(newMember.guild, offender, config, 'Repeated protected-role tampering');
       protectionAttempts.delete(key);
-      await log(newMember.guild, 'protected', 'Protection escalation', `${offender || auditEntry.executor} had permission roles removed after repeated protected-role tampering.`);
+      await log(newMember.guild, 'protected', 'Protection escalation', `${offender || auditEntry.executor} triggered protection escalation; action: ${action}.`);
     }
   }
 });
@@ -545,6 +695,15 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
   if (!member || member.user.bot) return;
 
   const guildId = member.guild.id;
+  const stfuKey = `${guildId}:${member.id}`;
+  if (stfuProcessing.has(stfuKey)) {
+    stfuProcessing.delete(stfuKey);
+  } else if (guildData(member.guild).stfu[member.id]?.active && newState.channel) {
+    if (!newState.serverMute) {
+      await log(member.guild, 'protected', 'Unauthorized STFU unmute', `${member} was unmuted while STFU was active; enforcement was reapplied.`);
+      await enforceStfu(member);
+    }
+  }
   if (!hasGodmode(godmodeDb, guildId, member.id)) return;
 
   const me = member.guild.members.me;
@@ -568,6 +727,7 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
     godmodeProcessing.set(muteKey, now + 1000);
     try {
       await member.voice?.setMute(false, 'Godmode protection');
+      await log(member.guild, 'protected', 'Godmode protection triggered', `${member} was automatically unmuted by Godmode.`);
     } catch (error) {
       console.error(`Godmode mute enforcement failed for ${member.id}:`, error?.message || error);
     }
@@ -579,6 +739,7 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
     godmodeProcessing.set(deafKey, now + 1000);
     try {
       await member.voice?.setDeaf(false, 'Godmode protection');
+      await log(member.guild, 'protected', 'Godmode protection triggered', `${member} was automatically undeafened by Godmode.`);
     } catch (error) {
       console.error(`Godmode deaf enforcement failed for ${member.id}:`, error?.message || error);
     }
